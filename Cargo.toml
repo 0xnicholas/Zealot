@@ -1,0 +1,25 @@
+[package]
+name = "zealot-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Ultralisk Inference Engine — component-level replacement for vLLM critical paths"
+
+[lib]
+name = "zealot_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+dashmap = "6"
+
+[dev-dependencies]
+pyo3 = { version = "0.23", features = ["auto-initialize"] }
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
