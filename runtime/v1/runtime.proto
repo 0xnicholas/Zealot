@@ -1,0 +1,223 @@
+// Runtime Interface — Ultralisk 推理能力的统一契约（ADR-010）。
+//
+// Gateway 和 Control Plane 只依赖本 proto，不感知任何具体引擎。
+// 每个 Backend Runtime（vLLM 适配器 / Zealot native）实现同一个 InferenceRuntime。
+//
+// 版本管理：proto3，包名带版本号 v1。破坏性变更升级目录与包名（v2），
+// 只允许新增字段，不复用字段编号。
+
+syntax = "proto3";
+
+package runtime.v1;
+
+import "google/protobuf/empty.proto";
+
+service InferenceRuntime {
+  // 模型生命周期
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // 推理执行（双向流）
+  // 首帧 control=STREAM_START（model + messages + params）；
+  // 后续帧 control=MESSAGE_APPEND（多轮对话追加）或 CANCEL（用户取消）。
+  // CANCEL 后 Backend 仍须发送 final 帧（已生成 token 照常计费），再关闭流。
+  rpc Infer(stream InferRequest) returns (stream InferResponse);
+
+  // 批处理
+  rpc SubmitBatch(BatchRequest) returns (BatchResponse);
+  rpc GetBatchStatus(BatchStatusRequest) returns (BatchStatusResponse);
+
+  // 健康检查与指标
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc StreamMetrics(google.protobuf.Empty) returns (stream MetricsSnapshot);
+}
+
+// ── 枚举 ────────────────────────────────────────────────
+
+enum Priority {
+  PRIORITY_LOWEST = 0;
+  PRIORITY_MEDIUM = 1;
+  PRIORITY_HIGH = 2;
+  PRIORITY_HIGHEST = 3;
+}
+
+enum BatchAffinity {
+  BATCH_AFFINITY_UNSPECIFIED = 0;
+  BATCH_AFFINITY_INTERACTIVE = 1; // 立即执行，不做攒批等待（Serverless/Reserved/Dedicated）
+  BATCH_AFFINITY_AGGRESSIVE = 2;  // 允许 60s 攒批窗口（Batch）
+}
+
+enum Quantization {
+  QUANTIZATION_UNSPECIFIED = 0;
+  QUANTIZATION_AWQ_INT4 = 1;
+  QUANTIZATION_FP8 = 2;
+  QUANTIZATION_FP16 = 3;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_HEALTHY = 1;
+  STATUS_DEGRADED = 2;
+  STATUS_UNHEALTHY = 3;
+}
+
+enum BatchState {
+  BATCH_STATE_UNSPECIFIED = 0;
+  BATCH_STATE_PENDING = 1;
+  BATCH_STATE_RUNNING = 2;
+  BATCH_STATE_COMPLETED = 3;
+  BATCH_STATE_FAILED = 4;
+}
+
+enum StreamControl {
+  STREAM_CONTROL_UNSPECIFIED = 0;
+  STREAM_START = 1;     // 推理开始：携带 model + messages + params
+  MESSAGE_APPEND = 2;   // 多轮对话追加消息
+  CANCEL = 3;           // 用户取消
+}
+
+// ── 推理 ────────────────────────────────────────────────
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message InferParams {
+  uint32 max_tokens = 1;
+  float temperature = 2;
+  float top_p = 3;
+  repeated string stop = 4;
+  string json_schema = 5; // 非空时启用 Constrained Decode（Zealot）
+}
+
+// 来自 Policy Engine 的调度提示。Backend 可以忽略（Phase 1 vLLM 忽略），
+// Phase 2 Zealot Scheduler 完整消费。
+message SchedulingHint {
+  Priority priority = 1;
+  uint32 deadline_ms = 2; // > 0 时，超过此时间未开始执行可降级或拒绝
+  BatchAffinity batch = 3;
+}
+
+message InferRequest {
+  string request_id = 1;
+  string model = 2;
+  repeated ChatMessage messages = 3;
+  InferParams params = 4;
+  StreamControl control = 5;
+  SchedulingHint scheduling_hint = 10;
+}
+
+message StreamDelta {
+  string text = 1;
+}
+
+message Usage {
+  uint32 prompt_tokens = 1;
+  uint32 completion_tokens = 2;
+  uint32 total_tokens = 3;
+}
+
+message FinalResponse {
+  Usage usage = 1;
+  string finish_reason = 2; // stop / length / cancel
+}
+
+message InferResponse {
+  string request_id = 1;
+  oneof payload {
+    StreamDelta delta = 2;
+    FinalResponse final = 3;
+  }
+}
+
+// ── 模型生命周期 ─────────────────────────────────────────
+
+message LoadModelRequest {
+  string model_id = 1;
+  Quantization quantization = 2;
+  uint32 gpu_count = 3;           // 需要几张 GPU
+  string gpu_type = 4;            // H100 / A100
+  map<string, string> labels = 5; // 调度标签（传给 KAI Scheduler）
+}
+
+message LoadModelResponse {
+  string model_id = 1;
+  bool ready = 2;
+  string message = 3;
+}
+
+message UnloadModelRequest {
+  string model_id = 1;
+}
+
+message UnloadModelResponse {
+  string model_id = 1;
+  bool unloaded = 2; // false 表示该模型本就不在
+  string message = 3;
+}
+
+message ListModelsRequest {}
+
+message LoadedModel {
+  string model_id = 1;
+  Quantization quantization = 2;
+  uint32 gpu_count = 3;
+  bool ready = 4;
+}
+
+message ListModelsResponse {
+  repeated LoadedModel models = 1;
+}
+
+// ── 批处理 ───────────────────────────────────────────────
+
+message BatchItem {
+  string request_id = 1;
+  repeated ChatMessage messages = 2;
+  InferParams params = 3;
+}
+
+message BatchRequest {
+  string model_id = 1;
+  repeated BatchItem items = 2;
+}
+
+message BatchResponse {
+  string batch_id = 1;
+  uint32 accepted = 2; // 接受的条目数
+}
+
+message BatchStatusRequest {
+  string batch_id = 1;
+}
+
+message BatchStatusResponse {
+  string batch_id = 1;
+  BatchState state = 2;
+  uint32 completed = 3;
+  uint32 total = 4;
+}
+
+// ── 健康检查与指标 ───────────────────────────────────────
+
+message HealthCheckRequest {}
+
+// Gateway 的三层健康模型（active/passive/circuit）直接消费此结构化状态。
+message HealthCheckResponse {
+  Status status = 1;
+  uint32 queue_depth = 2;     // 等待中的请求数
+  float gpu_util_pct = 3;     // GPU 利用率
+  float memory_used_gb = 4;   // 显存使用量
+  uint32 active_requests = 5; // 正在处理的请求数
+}
+
+message MetricsSnapshot {
+  uint64 timestamp_unix_ms = 1;
+  float gpu_util_pct = 2;
+  float memory_used_gb = 3;
+  uint32 active_requests = 4;
+  uint32 queue_depth = 5;
+  double tokens_per_second = 6;
+}
