@@ -29,6 +29,9 @@ pub enum ZealotError {
     #[error("Schema compilation timed out after {0}ms")]
     SchemaCompileTimeout(u64),
 
+    #[error("Sequence too long: worst case needs {required} blocks, pool capacity is {capacity}")]
+    SequenceTooLong { required: usize, capacity: usize },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

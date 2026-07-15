@@ -1,19 +1,23 @@
 use pyo3::prelude::*;
 
-mod block_manager;
+pub mod block_manager;
 mod constrained_decode;
-mod error;
+pub mod engine;
+pub mod error;
+pub mod model_runner_py;
+pub mod scheduler;
 
-/// Zealot Inference Engine — Rust-accelerated vLLM components.
+/// Zealot Inference Engine — standalone engine (no vLLM fork), ADR-009.
 ///
-/// Architecture (ADR-009):
-///   Python ──→ API Server + Model Loader (retained from vLLM)
-///   Rust   ──→ Block Manager + Constrained Decode + Scheduler (component-level replacement)
+/// Architecture:
+///   Rust   ──→ main process: gRPC server (tonic) + Scheduler
+///              + Block Manager + Constrained Decode
+///   Python ──→ Model Loader only (HuggingFace, embedded via PyO3 at startup)
 ///   CUDA   ──→ Attention Kernel + Quantization (modified, not rewritten)
 ///
-/// Language boundary: PyO3 (Rust → Python .so), zero-copy where possible.
-/// The Rust components are injected into vLLM's Python codebase via the
-/// same FFI mechanism vLLM already uses for its C++ extensions (_C.abi3.so).
+/// M4 state: components ship as a cdylib Python extension (`zealot_engine`)
+/// for GPU-free development and testing. The tonic main process with
+/// embedded CPython is the integration target (docs/architecture.md §5).
 
 #[pymodule]
 #[pyo3(name = "zealot_engine")]

@@ -2,19 +2,30 @@
 name = "zealot-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Ultralisk Inference Engine — component-level replacement for vLLM critical paths"
+description = "Ultralisk Inference Engine — standalone Rust engine, no vLLM fork (ADR-009)"
 
 [lib]
 name = "zealot_engine"
-crate-type = ["cdylib"]
+# cdylib → Python 扩展（maturin）；rlib → zealot-backend bin 复用 scheduler/engine
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 dashmap = "6"
+# zealot-backend bin: Runtime Interface gRPC server (ADR-010)
+tonic = "0.13"
+prost = "0.13"
+prost-types = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-build = "0.13"
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 pyo3 = { version = "0.23", features = ["auto-initialize"] }

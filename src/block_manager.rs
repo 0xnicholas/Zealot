@@ -40,49 +40,15 @@ pub struct BlockManager {
 impl BlockManager {
     #[new]
     fn new(num_gpu_blocks: usize, block_size: usize) -> PyResult<Self> {
-        if block_size == 0 {
-            return Err(ZealotError::InvalidBlockSize(block_size).into());
-        }
-
-        let mut free_list: Vec<usize> = (0..num_gpu_blocks).collect();
-        // LIFO for cache locality: pop from end gives recently-freed blocks
-        free_list.reverse();
-
-        Ok(Self {
-            num_gpu_blocks,
-            block_size,
-            free_list: Mutex::new(free_list),
-            refcount: (0..num_gpu_blocks).map(|_| AtomicUsize::new(0)).collect(),
-            generation: (0..num_gpu_blocks).map(|_| AtomicU64::new(1)).collect(),
-        })
+        Ok(Self::create(num_gpu_blocks, block_size)?)
     }
 
     fn allocate(&self) -> PyResult<BlockHandle> {
-        let mut free = self.free_list.lock().unwrap();
-        let block_id = free.pop().ok_or(ZealotError::OutOfBlocks {
-            requested: 1,
-            available: free.len(),
-        })?;
-        drop(free);
-
-        let gen = self.generation[block_id].load(Ordering::Acquire);
-        self.refcount[block_id].store(1, Ordering::Release);
-        Ok(BlockHandle {
-            block_id,
-            generation: gen,
-        })
+        Ok(self.try_allocate()?)
     }
 
     fn free(&self, handle: &BlockHandle) -> PyResult<()> {
-        self.check_handle(handle)?;
-
-        let prev = self.refcount[handle.block_id].fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            self.generation[handle.block_id].fetch_add(1, Ordering::AcqRel);
-            let mut free = self.free_list.lock().unwrap();
-            free.push(handle.block_id);
-        }
-        Ok(())
+        Ok(self.try_free(handle)?)
     }
 
     fn reference(&self, handle: &BlockHandle) -> PyResult<()> {
@@ -108,9 +74,64 @@ impl BlockManager {
 }
 
 impl BlockManager {
-    fn check_handle(&self, handle: &BlockHandle) -> PyResult<()> {
+    /// Rust-native 构造路径（Scheduler 用）。[[new]] pymethod 委托到这里。
+    pub(crate) fn create(num_gpu_blocks: usize, block_size: usize) -> Result<Self, ZealotError> {
+        if block_size == 0 {
+            return Err(ZealotError::InvalidBlockSize(block_size));
+        }
+
+        let mut free_list: Vec<usize> = (0..num_gpu_blocks).collect();
+        // LIFO for cache locality: pop from end gives recently-freed blocks
+        free_list.reverse();
+
+        Ok(Self {
+            num_gpu_blocks,
+            block_size,
+            free_list: Mutex::new(free_list),
+            refcount: (0..num_gpu_blocks).map(|_| AtomicUsize::new(0)).collect(),
+            generation: (0..num_gpu_blocks).map(|_| AtomicU64::new(1)).collect(),
+        })
+    }
+
+    /// Rust-native 分配路径（Scheduler 用）。与 #[pymethods] 版本语义相同，
+    /// 但返回 ZealotError 以便直接 match（如 OutOfBlocks 触发抢占）。
+    pub(crate) fn try_allocate(&self) -> Result<BlockHandle, ZealotError> {
+        let mut free = self.free_list.lock().unwrap();
+        let block_id = free.pop().ok_or(ZealotError::OutOfBlocks {
+            requested: 1,
+            available: free.len(),
+        })?;
+        drop(free);
+
+        let gen = self.generation[block_id].load(Ordering::Acquire);
+        self.refcount[block_id].store(1, Ordering::Release);
+        Ok(BlockHandle {
+            block_id,
+            generation: gen,
+        })
+    }
+
+    /// Rust-native 释放路径（Scheduler 用）。
+    pub(crate) fn try_free(&self, handle: &BlockHandle) -> Result<(), ZealotError> {
+        self.check(handle)?;
+
+        let prev = self.refcount[handle.block_id].fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.generation[handle.block_id].fetch_add(1, Ordering::AcqRel);
+            let mut free = self.free_list.lock().unwrap();
+            free.push(handle.block_id);
+        }
+        Ok(())
+    }
+
+    /// 当前空闲 block 数。
+    pub(crate) fn available(&self) -> usize {
+        self.free_list.lock().unwrap().len()
+    }
+
+    fn check(&self, handle: &BlockHandle) -> Result<(), ZealotError> {
         if handle.block_id >= self.num_gpu_blocks {
-            return Err(ZealotError::BlockNotAllocated(handle.block_id).into());
+            return Err(ZealotError::BlockNotAllocated(handle.block_id));
         }
         let current_gen = self.generation[handle.block_id].load(Ordering::Acquire);
         if handle.generation != current_gen {
@@ -118,10 +139,13 @@ impl BlockManager {
                 block_id: handle.block_id,
                 handle_gen: handle.generation,
                 current_gen,
-            }
-            .into());
+            });
         }
         Ok(())
+    }
+
+    fn check_handle(&self, handle: &BlockHandle) -> PyResult<()> {
+        Ok(self.check(handle)?)
     }
 }
 

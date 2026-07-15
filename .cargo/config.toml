@@ -1,0 +1,4 @@
+# pyo3 0.23 最高支持 Python 3.13，而本机默认 python3 是 3.14。
+# 固定用 python3.12 构建 zealot_engine（PYO3_PYTHON 走 PATH 查找，需自行安装）。
+[env]
+PYO3_PYTHON = "python3.12"
