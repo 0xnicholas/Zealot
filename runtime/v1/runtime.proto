@@ -90,6 +90,11 @@ message InferParams {
   float top_p = 3;
   repeated string stop = 4;
   string json_schema = 5; // 非空时启用 Constrained Decode（Zealot）
+  uint32 top_k = 6;
+  float repetition_penalty = 7;
+  float frequency_penalty = 8;
+  float presence_penalty = 9;
+  uint64 seed = 10;       // 0 = use engine-default RNG
 }
 
 // 来自 Policy Engine 的调度提示。Backend 可以忽略（Phase 1 vLLM 忽略），
