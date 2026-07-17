@@ -20,7 +20,9 @@ use tonic::{transport::Server, Request, Response, Status, Streaming};
 
 use zealot_engine::engine::Engine;
 use zealot_engine::model_runner_py::PyModelRunner;
+use zealot_engine::sampling::SamplingParams;
 use zealot_engine::scheduler::{Priority, Scheduler, SchedulerConfig};
+use zealot_engine::tokenizer::Tokenizer;
 
 mod runtime_v1 {
     tonic::include_proto!("runtime.v1");
@@ -47,6 +49,7 @@ enum EngineCmd {
         messages: Vec<(String, String)>,
         max_tokens: usize,
         priority: Priority,
+        sampling_params: SamplingParams,
         tx: Tx,
     },
     Cancel {
@@ -99,6 +102,7 @@ fn handle_cmd(
             messages,
             max_tokens,
             priority,
+            sampling_params,
             tx,
         } => {
             let made = engine
@@ -111,6 +115,7 @@ fn handle_cmd(
                         max_tokens,
                         priority,
                         eos,
+                        sampling_params,
                     )
                 });
             match made {
@@ -175,7 +180,7 @@ fn run_engine(
                     let frame = InferResponse {
                         request_id: t.request_id.clone(),
                         payload: Some(Payload::Delta(StreamDelta {
-                            text: t.text.unwrap_or_default(),
+                            text: t.text.unwrap_or_else(|| format!("<tk:{}>", t.token)),
                         })),
                     };
                     if tx.blocking_send(Ok(frame)).is_err() {
@@ -230,6 +235,18 @@ fn map_priority(p: i32) -> Priority {
     }
 }
 
+fn infer_params_to_sampling(params: &runtime_v1::InferParams) -> SamplingParams {
+    SamplingParams {
+        temperature: params.temperature,
+        top_k: params.top_k,
+        top_p: params.top_p,
+        repetition_penalty: if params.repetition_penalty == 0.0 { 1.0 } else { params.repetition_penalty },
+        frequency_penalty: params.frequency_penalty,
+        presence_penalty: params.presence_penalty,
+        seed: if params.seed == 0 { None } else { Some(params.seed) },
+    }
+}
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tonic::async_trait]
@@ -278,7 +295,11 @@ impl InferenceRuntime for ZealotBackend {
         let eos = runner.eos_token_id();
         let sched = Scheduler::new(SchedulerConfig::default())
             .map_err(|e| Status::internal(e.to_string()))?;
-        let engine = Engine::new(sched, runner);
+        let mut engine = Engine::new(sched, runner);
+        // Try to load tokenizer.json from model cache for Rust-side decoding
+        if let Ok(tok) = Tokenizer::load(&req.model_id) {
+            engine = engine.with_tokenizer(tok);
+        }
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || run_engine(engine, eos, cmd_rx));
 
@@ -394,12 +415,16 @@ impl InferenceRuntime for ZealotBackend {
             .unwrap_or_default();
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let sampling = first.params.as_ref()
+            .map(infer_params_to_sampling)
+            .unwrap_or_default();
         cmd_tx
             .send(EngineCmd::Infer {
                 request_id: request_id.clone(),
                 messages,
                 max_tokens,
                 priority,
+                sampling_params: sampling,
                 tx,
             })
             .map_err(|_| Status::internal("engine thread gone"))?;

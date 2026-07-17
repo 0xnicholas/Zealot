@@ -8,6 +8,7 @@ use std::cmp::Reverse;
 
 use crate::block_manager::{BlockHandle, BlockManager};
 use crate::error::ZealotError;
+use crate::sampling::SamplingParams;
 
 /// 调度优先级，与 proto `runtime.v1.Priority` 一一对应（bin 层做转换）。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -62,6 +63,8 @@ pub struct Sequence {
     arrival: u64,
     status: SeqStatus,
     blocks: Vec<BlockHandle>,
+    /// Sampling parameters for this sequence.
+    pub sampling_params: SamplingParams,
     /// true = 下一步需要 prefill（初始，或被抢占后需 recompute）
     prefill_pending: bool,
 }
@@ -74,6 +77,7 @@ impl Sequence {
         priority: Priority,
         eos_token_id: Option<i64>,
         arrival: u64,
+        sampling_params: SamplingParams,
     ) -> Self {
         Self {
             request_id,
@@ -86,6 +90,7 @@ impl Sequence {
             status: SeqStatus::Waiting,
             blocks: Vec::new(),
             prefill_pending: true,
+            sampling_params,
         }
     }
 
@@ -120,12 +125,14 @@ impl Sequence {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerConfig {
-    /// 同时运行的最大序列数
+    /// 同时运行的最大序列数（decode 阶段）
     pub max_num_seqs: usize,
     /// KV block 大小（token 数）
     pub block_size: usize,
     /// block 池总容量
     pub num_gpu_blocks: usize,
+    /// 单步 prefill 的最大 token 总数（限制 prefilling 的计算量）
+    pub max_prefill_tokens: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -134,6 +141,7 @@ impl Default for SchedulerConfig {
             max_num_seqs: 8,
             block_size: 16,
             num_gpu_blocks: 1024,
+            max_prefill_tokens: 2048,
         }
     }
 }
@@ -160,9 +168,12 @@ pub enum CancelOutcome {
 pub struct Scheduler {
     cfg: SchedulerConfig,
     bm: BlockManager,
-    /// 按 (priority desc, arrival asc) 排序
+    /// 按 (priority desc, arrival asc) 排序的等待队列
     waiting: Vec<Sequence>,
-    running: Vec<Sequence>,
+    /// Prefill 阶段的序列（计算密集，受 max_prefill_tokens 限制）
+    prefilling: Vec<Sequence>,
+    /// Decode 阶段的序列（内存密集，受 max_num_seqs 限制）
+    decoding: Vec<Sequence>,
     next_arrival: u64,
 }
 
@@ -172,7 +183,8 @@ impl Scheduler {
             cfg,
             bm: BlockManager::create(cfg.num_gpu_blocks, cfg.block_size)?,
             waiting: Vec::new(),
-            running: Vec::new(),
+            prefilling: Vec::new(),
+            decoding: Vec::new(),
             next_arrival: 0,
         })
     }
@@ -186,6 +198,7 @@ impl Scheduler {
         max_tokens: usize,
         priority: Priority,
         eos_token_id: Option<i64>,
+        sampling_params: SamplingParams,
     ) -> Result<Sequence, ZealotError> {
         let worst = blocks_for(prompt_tokens.len() + max_tokens, self.cfg.block_size);
         if worst > self.cfg.num_gpu_blocks {
@@ -203,6 +216,7 @@ impl Scheduler {
             priority,
             eos_token_id,
             arrival,
+            sampling_params,
         ))
     }
 
@@ -219,19 +233,29 @@ impl Scheduler {
         self.waiting.insert(pos, seq);
     }
 
-    /// 形成本步批次：提升 waiting → running（受 max_num_seqs 与 block 约束），
-    /// 为 decode 增长分配新 block（OOM 时触发抢占）。
+    /// 形成本步批次：
+    /// 1. 提升 waiting → prefilling（受 max_prefill_tokens 和 block 预算约束）
+    /// 2. 为 prefilling + decoding 分配/补充 block（OOM → 抢占）
+    /// 批量返回所有活跃 seq（prefilling + decoding）。
+    /// Runner 通过 seq.is_prefill() 区分阶段。
     pub fn schedule(&mut self) -> ScheduleOutput<'_> {
         let mut preempted = Vec::new();
+        let total_seqs = self.prefilling.len() + self.decoding.len();
 
-        // 1. 提升 waiting → running
+        // ── 1. 提升 waiting → prefilling ───────────────────────────────
+        //    同时受 max_num_seqs（总运行数）和 max_prefill_tokens 限制。
+        let mut prefill_tokens = 0_usize;
         while let Some(seq) = self.waiting.first() {
-            if self.running.len() >= self.cfg.max_num_seqs {
+            if total_seqs + self.prefilling.len() >= self.cfg.max_num_seqs {
                 break;
             }
-            let need = blocks_for(seq.len(), self.cfg.block_size);
+            let tokens = seq.len(); // prompt + 已生成的 output_tokens
+            if prefill_tokens + tokens > self.cfg.max_prefill_tokens && prefill_tokens > 0 {
+                break; // 本步 prefill token 预算用尽，剩余的 prefill 等下一步
+            }
+            let need = blocks_for(tokens, self.cfg.block_size);
             if self.bm.available() < need {
-                break; // 等资源：running 完成或抢占释放后下一轮
+                break; // block 不足，等 running 释放或抢占
             }
             let mut seq = self.waiting.remove(0);
             for _ in 0..need {
@@ -239,74 +263,105 @@ impl Scheduler {
                 seq.blocks.push(h);
             }
             seq.status = SeqStatus::Running;
-            self.running.push(seq);
+            prefill_tokens += tokens;
+            self.prefilling.push(seq);
         }
 
-        // 2. decode 增长：跨越 block 边界时补分配，OOM → 抢占。
-        //    抢占会把 victim 从 running 移除，索引可能前移，需调整。
+        // ── 2. 为 prefilling + decoding 补齐 block ────────────────────────
         let mut i = 0;
-        while i < self.running.len() {
-            i = self.ensure_blocks(i, &mut preempted) + 1;
+        while i < self.prefilling.len() {
+            i = Self::ensure_blocks(&mut self.prefilling, &self.cfg, &mut self.bm, &mut self.waiting, i, &mut preempted) + 1;
         }
+        let mut i = 0;
+        while i < self.decoding.len() {
+            i = Self::ensure_blocks(&mut self.decoding, &self.cfg, &mut self.bm, &mut self.waiting, i, &mut preempted) + 1;
+        }
+
+        // ── 3. 组装批次 ──────────────────────────────────────────────────
+        let prefilling = &mut self.prefilling;
+        let decoding = &mut self.decoding;
+        let batch: Vec<&mut Sequence> = prefilling.iter_mut().chain(decoding.iter_mut()).collect();
 
         ScheduleOutput {
-            batch: self.running.iter_mut().collect(),
+            batch,
             preempted,
         }
     }
 
-    /// 确保 running[idx] 的 block 数覆盖其当前长度。
+    /// 确保 queue[idx] 的 block 数覆盖其当前长度。
     /// 返回 requester 在抢占调整后的新索引。
-    fn ensure_blocks(&mut self, idx: usize, preempted: &mut Vec<String>) -> usize {
+    fn ensure_blocks(
+        queue: &mut Vec<Sequence>,
+        cfg: &SchedulerConfig,
+        bm: &mut BlockManager,
+        waiting: &mut Vec<Sequence>,
+        idx: usize,
+        preempted: &mut Vec<String>,
+    ) -> usize {
         let mut idx = idx;
-        let need = blocks_for(self.running[idx].len(), self.cfg.block_size);
-        while self.running[idx].blocks.len() < need {
-            match self.bm.try_allocate() {
-                Ok(h) => self.running[idx].blocks.push(h),
-                Err(_) => match self.preempt_victim(idx, preempted) {
-                    Some(victim_idx) => {
-                        if victim_idx < idx {
-                            idx -= 1;
+        let need = blocks_for(queue[idx].len(), cfg.block_size);
+        while queue[idx].blocks.len() < need {
+            match bm.try_allocate() {
+                Ok(h) => queue[idx].blocks.push(h),
+                Err(_) => {
+                    // 抢占 queue 中优先级最低的（除 requester 自身）
+                    let victim_idx = queue
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != idx)
+                        .min_by_key(|(_, s)| (s.priority, Reverse(s.arrival)))
+                        .map(|(i, _)| i);
+                    match victim_idx {
+                        Some(vi) => {
+                            let mut victim = queue.remove(vi);
+                            for h in std::mem::take(&mut victim.blocks) {
+                                bm.try_free(&h).expect("owned handle");
+                            }
+                            victim.prefill_pending = true;
+                            victim.status = SeqStatus::Waiting;
+                            preempted.push(victim.request_id.clone());
+                            let key = (Reverse(victim.priority), victim.arrival);
+                            let pos = waiting
+                                .partition_point(|s| (Reverse(s.priority), s.arrival) <= key);
+                            waiting.insert(pos, victim);
+                            if vi < idx {
+                                idx -= 1;
+                            }
                         }
+                        None => break, // 只剩自己，等下一轮
                     }
-                    // 无可抢占（只剩自己）：本轮先不增长，等下一轮
-                    None => break,
                 },
             }
         }
         idx
     }
 
-    /// 抢占优先级最低的 running seq（平级取最晚到达），requester 自身除外。
-    /// 返回 victim 被移除前的索引；除 requester 外无人可抢时返回 None。
-    fn preempt_victim(&mut self, requester: usize, preempted: &mut Vec<String>) -> Option<usize> {
-        let victim_idx = self
-            .running
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != requester)
-            .min_by_key(|(_, s)| (s.priority, Reverse(s.arrival)))
-            .map(|(i, _)| i)?;
-        let mut victim = self.running.remove(victim_idx);
-        for h in std::mem::take(&mut victim.blocks) {
-            self.bm.try_free(&h).expect("owned handle");
+    /// 完成：从 prefilling 或 decoding 队列移除并释放全部 block。
+    pub fn finish(&mut self, request_id: &str) -> Option<(usize, usize)> {
+        if let Some(idx) = self.prefilling.iter().position(|s| s.request_id == request_id) {
+            let mut seq = self.prefilling.remove(idx);
+            for h in std::mem::take(&mut seq.blocks) {
+                self.bm.try_free(&h).expect("owned handle");
+            }
+            return Some((seq.prompt_tokens.len(), seq.output_tokens.len()));
         }
-        // recompute 语义：保留已生成 token，重排等待队列，恢复时需 re-prefill
-        victim.prefill_pending = true;
-        victim.status = SeqStatus::Waiting;
-        preempted.push(victim.request_id.clone());
-        self.insert_waiting(victim);
-        Some(victim_idx)
+        if let Some(idx) = self.decoding.iter().position(|s| s.request_id == request_id) {
+            let mut seq = self.decoding.remove(idx);
+            for h in std::mem::take(&mut seq.blocks) {
+                self.bm.try_free(&h).expect("owned handle");
+            }
+            return Some((seq.prompt_tokens.len(), seq.output_tokens.len()));
+        }
+        None
     }
 
-    /// 完成：从 running 移除并释放全部 block。返回 seq 的 (prompt_len, output_len)。
-    pub fn finish(&mut self, request_id: &str) -> Option<(usize, usize)> {
-        let idx = self.running.iter().position(|s| s.request_id == request_id)?;
-        let mut seq = self.running.remove(idx);
-        for h in std::mem::take(&mut seq.blocks) {
-            self.bm.try_free(&h).expect("owned handle");
+    /// 将指定 seq 从 prefilling 移至 decoding（Engine 在 prefill 完成后调用）
+    pub fn promote_to_decoding(&mut self, request_id: &str) {
+        if let Some(idx) = self.prefilling.iter().position(|s| s.request_id == request_id) {
+            let mut seq = self.prefilling.remove(idx);
+            seq.prefill_pending = false;
+            self.decoding.push(seq);
         }
-        Some((seq.prompt_tokens.len(), seq.output_tokens.len()))
     }
 
     /// 取消：waiting 中直接移除；running 中按 finish 处理（返回 WasRunning，
@@ -323,7 +378,7 @@ impl Scheduler {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.waiting.is_empty() && self.running.is_empty()
+        self.waiting.is_empty() && self.prefilling.is_empty() && self.decoding.is_empty()
     }
 
     #[cfg(test)]
@@ -341,6 +396,7 @@ mod tests {
             max_num_seqs,
             block_size,
             num_gpu_blocks,
+            max_prefill_tokens: 1024,
         }
     }
 
@@ -352,7 +408,7 @@ mod tests {
         priority: Priority,
     ) {
         let seq = sched
-            .make_sequence(id.into(), vec![1; prompt_len], max_tokens, priority, None)
+            .make_sequence(id.into(), vec![1; prompt_len], max_tokens, priority, None, SamplingParams::default())
             .unwrap();
         sched.add(seq);
     }
@@ -396,7 +452,7 @@ mod tests {
         let mut sched = Scheduler::new(cfg(8, 2, 2)).unwrap();
         // prompt 2 + max_tokens 8 = 10 token → 5 block > 池 2
         let err = sched
-            .make_sequence("huge".into(), vec![1; 2], 8, Priority::Medium, None)
+            .make_sequence("huge".into(), vec![1; 2], 8, Priority::Medium, None, SamplingParams::default())
             .unwrap_err();
         assert!(matches!(err, ZealotError::SequenceTooLong { .. }));
     }

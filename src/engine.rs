@@ -5,7 +5,10 @@
 //! 不感知模型实现（dev-mode PyTorch CPU / 目标 CUDA kernel）。
 
 use crate::error::ZealotError;
+use crate::sampling::Sampler;
 use crate::scheduler::{FinishReason, Scheduler, Sequence};
+use rand::Rng;
+use rand::SeedableRng;
 
 /// 模型执行端。dev-mode: PyTorch CPU（`model_runner_py`）；
 /// 目标形态: Rust + CUDA kernel。实现必须是 `Send`（Engine 跑在独立线程）。
@@ -21,7 +24,10 @@ pub trait ModelRunner: Send {
 
 pub struct StepOut {
     pub request_id: String,
-    pub token: i64,
+    pub token: Option<i64>,
+    /// Raw logits from the model forward pass. When present,
+    /// Engine uses its own Sampler instead of the runner's token.
+    pub logits: Option<Vec<f32>>,
     /// 增量文本（runner 侧 detokenize）。None 表示 runner 不提供文本。
     pub text: Option<String>,
 }
@@ -48,11 +54,26 @@ pub struct StepResult {
 pub struct Engine<R: ModelRunner> {
     sched: Scheduler,
     runner: R,
+    sampler: Sampler,
+    rng: rand::rngs::StdRng,
+    tokenizer: Option<crate::tokenizer::Tokenizer>,
 }
 
 impl<R: ModelRunner> Engine<R> {
     pub fn new(sched: Scheduler, runner: R) -> Self {
-        Self { sched, runner }
+        Self {
+            sched,
+            runner,
+            sampler: Sampler,
+            rng: rand::rngs::StdRng::from_entropy(),
+            tokenizer: None,
+        }
+    }
+
+    /// Set a tokenizer for decoding sampled tokens to text.
+    pub fn with_tokenizer(mut self, tokenizer: crate::tokenizer::Tokenizer) -> Self {
+        self.tokenizer = Some(tokenizer);
+        self
     }
 
     pub fn scheduler(&self) -> &Scheduler {
@@ -102,6 +123,10 @@ impl<R: ModelRunner> Engine<R> {
         }
 
         let was_prefill: Vec<bool> = batch.iter().map(|s| s.is_prefill()).collect();
+        let prefilled_ids: Vec<String> = batch.iter()
+            .filter(|s| s.is_prefill())
+            .map(|s| s.request_id.clone())
+            .collect();
         for step_out in self.runner.step(&mut batch)? {
             let Some(seq) = batch
                 .iter_mut()
@@ -109,20 +134,37 @@ impl<R: ModelRunner> Engine<R> {
             else {
                 continue; // runner 返回了未知 seq，忽略
             };
-            seq.output_tokens.push(step_out.token);
+            // Runner may provide its own token OR raw logits for Engine sampling.
+            let token = if let Some(t) = step_out.token {
+                t
+            } else if let Some(logits) = step_out.logits {
+                // Engine-side sampling using per-request seed if specified, otherwise engine-global RNG
+                let mut req_rng = if let Some(seed) = seq.sampling_params.seed {
+                    rand::rngs::StdRng::seed_from_u64(seed)
+                } else {
+                    // Advance the engine RNG and seed a per-request RNG from it
+                    let seed = self.rng.gen::<u64>();
+                    rand::rngs::StdRng::seed_from_u64(seed)
+                };
+                match self.sampler.sample(&logits, &seq.output_tokens, &seq.sampling_params, &mut req_rng) {
+                    Ok(sampled) => sampled.token_id,
+                    Err(_) => 0,
+                }
+            } else {
+                0 // No token and no logits — should not happen
+            };
+            seq.output_tokens.push(token);
+            // Decode token text if we have a Rust tokenizer, else use runner-provided text
+            let text = step_out.text.or_else(|| {
+                self.tokenizer.as_ref().and_then(|t| t.decode_single(token))
+            });
             result.tokens.push(TokenOut {
                 request_id: step_out.request_id,
-                token: step_out.token,
-                text: step_out.text,
+                token,
+                text,
             });
         }
-        for (seq, was) in batch.iter_mut().zip(was_prefill) {
-            if was {
-                seq.mark_prefilled();
-            }
-        }
-
-        // 停止条件：EOS 优先于 max_tokens
+        // ── Collect stop-condition data before mutating scheduler ──────
         let finished: Vec<(String, FinishReason)> = batch
             .iter()
             .filter_map(|seq| {
@@ -135,6 +177,18 @@ impl<R: ModelRunner> Engine<R> {
                 }
             })
             .collect();
+
+        for (seq, was) in batch.iter_mut().zip(was_prefill) {
+            if was {
+                seq.mark_prefilled();
+            }
+        }
+        // batch borrow ends here — safe to mutate scheduler
+        drop(batch);
+        for rid in prefilled_ids {
+            self.sched.promote_to_decoding(&rid);
+        }
+
         for (request_id, reason) in finished {
             self.runner.drop_state(&request_id);
             if let Some((prompt, completion)) = self.sched.finish(&request_id) {
@@ -153,6 +207,7 @@ impl<R: ModelRunner> Engine<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sampling::SamplingParams;
     use crate::scheduler::{Priority, SchedulerConfig};
     use std::collections::VecDeque;
 
@@ -167,7 +222,8 @@ mod tests {
                 .iter()
                 .map(|s| StepOut {
                     request_id: s.request_id.clone(),
-                    token: self.tokens.pop_front().unwrap_or(0),
+                    token: Some(self.tokens.pop_front().unwrap_or(0)),
+                    logits: None,
                     text: None,
                 })
                 .collect())
@@ -179,6 +235,7 @@ mod tests {
             max_num_seqs: 4,
             block_size: 2,
             num_gpu_blocks: 16,
+            max_prefill_tokens: 256,
         })
         .unwrap();
         Engine::new(
@@ -192,7 +249,7 @@ mod tests {
     fn submit(engine: &mut Engine<ScriptRunner>, id: &str, max_tokens: usize, eos: Option<i64>) {
         let seq = engine
             .scheduler_mut()
-            .make_sequence(id.into(), vec![1, 2], max_tokens, Priority::Medium, eos)
+            .make_sequence(id.into(), vec![1, 2], max_tokens, Priority::Medium, eos, SamplingParams::default())
             .unwrap();
         engine.scheduler_mut().add(seq);
     }
@@ -254,5 +311,56 @@ mod tests {
         assert!(engine.cancel("a").is_some());
         assert!(engine.is_idle());
         assert!(engine.cancel("a").is_none(), "already finished");
+    }
+
+    /// Verifies that a runner providing logits runs through the sampler-based
+    /// Engine step loop and generates tokens.
+    #[test]
+    fn engine_samples_from_logits() {
+        use std::collections::VecDeque;
+
+        struct LogitRunner {
+            logits: VecDeque<Vec<f32>>,
+        }
+        impl ModelRunner for LogitRunner {
+            fn step(&mut self, batch: &mut [&mut Sequence]) -> Result<Vec<StepOut>, ZealotError> {
+                Ok(batch
+                    .iter()
+                    .map(|s| StepOut {
+                        request_id: s.request_id.clone(),
+                        token: None,
+                        logits: self.logits.pop_front(),
+                        text: None,
+                    })
+                    .collect())
+            }
+        }
+
+        // Logits heavily biased toward token 42
+        let mut logits: VecDeque<Vec<f32>> = VecDeque::new();
+        for _ in 0..5 {
+            let mut l = vec![0.0_f32; 100];
+            l[42] = 100.0;
+            logits.push_back(l);
+        }
+
+        let sched = Scheduler::new(SchedulerConfig::default()).unwrap();
+        let mut engine = Engine::new(sched, LogitRunner { logits });
+        let sampling = SamplingParams { temperature: 0.0, ..Default::default() };
+        let seq = engine.scheduler_mut()
+            .make_sequence("r1".into(), vec![1, 2], 5, Priority::Medium, None, sampling)
+            .unwrap();
+        engine.scheduler_mut().add(seq);
+
+        let mut tokens = Vec::new();
+        while !engine.is_idle() {
+            let res = engine.step().unwrap();
+            for t in &res.tokens {
+                tokens.push(t.token);
+            }
+        }
+        // With temperature=0 (greedy), should always pick token 42
+        assert_eq!(tokens, vec![42, 42, 42, 42, 42]);
+        assert!(tokens.len() == 5);
     }
 }

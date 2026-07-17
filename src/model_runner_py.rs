@@ -124,8 +124,8 @@ impl PyModelRunner {
         })
     }
 
-    /// 增量 detokenize。注意：逐 token decode 可能切裂多字节字符
-    /// （dev-mode 限制；目标形态是 Rust Tokenizer 零拷贝增量解码）。
+    /// 增量 detokenize。将用于未来的 Rust tokenizer 集成。
+    #[allow(dead_code)]
     fn decode_token(&self, py: Python<'_>, token: i64) -> Option<String> {
         let kwargs = PyDict::new(py);
         kwargs.set_item("skip_special_tokens", true).ok()?;
@@ -163,14 +163,15 @@ impl ModelRunner for PyModelRunner {
                     .map_err(py_err("model forward"))?;
                 let out = out.bind(py);
 
-                // greedy argmax（dev-mode；temperature/top_p 采样后续接入）
+                // Extract raw logits for the last token position.
+                // Engine will run the Rust Sampler on these.
                 let logits = out.getattr("logits").map_err(py_err("logits"))?;
                 let last = logits.get_item((0, -1)).map_err(py_err("logits last"))?;
-                let token: i64 = last
-                    .call_method0("argmax")
-                    .and_then(|t| t.call_method0("item"))
-                    .and_then(|t| t.extract())
-                    .map_err(py_err("argmax"))?;
+                // Convert to Python list then to Rust Vec<f32>
+                let logits_list: Vec<f32> = last
+                    .call_method0("tolist")
+                    .and_then(|l| l.extract())
+                    .map_err(py_err("logits tolist"))?;
 
                 let past = out
                     .getattr("past_key_values")
@@ -179,8 +180,9 @@ impl ModelRunner for PyModelRunner {
 
                 outs.push(StepOut {
                     request_id: seq.request_id.clone(),
-                    token,
-                    text: self.decode_token(py, token),
+                    token: None,     // Let Engine's Sampler decide
+                    logits: Some(logits_list),
+                    text: None,      // Detokenization happens post-sampling (future: Rust tokenizer)
                 });
             }
             Ok(outs)
