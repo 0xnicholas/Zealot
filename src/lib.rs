@@ -5,7 +5,9 @@ mod constrained_decode;
 pub mod engine;
 pub mod error;
 pub mod model_runner_py;
+pub mod sampling;
 pub mod scheduler;
+pub mod tokenizer;
 
 /// Zealot Inference Engine — standalone engine (no vLLM fork), ADR-009.
 ///
