@@ -4,7 +4,7 @@
 //! CPU-side `&[f32]` computations suitable for vocabularies up to
 //! 128k tokens. No allocation per step is wasted where avoidable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use rand::Rng;
 
@@ -94,30 +94,28 @@ impl Sampler {
             }
         }
 
-        // ── 4. Presence penalty (binary: token appears → flat subtract)  ──
-        if params.presence_penalty != 0.0 && !prev_output_ids.is_empty() {
-            let mut seen: HashSet<i64> = HashSet::new();
-            for &id in prev_output_ids {
-                seen.insert(id);
-            }
-            for id in seen {
-                let idx = id as usize;
-                if idx < scores.len() {
-                    scores[idx] -= params.presence_penalty;
-                }
-            }
-        }
-
-        // ── 5. Frequency penalty (count-based linear subtract) ────────────
-        if params.frequency_penalty != 0.0 && !prev_output_ids.is_empty() {
+        // ── 4/5. Presence + frequency penalties (merged pass) ────────────
+        // Presence penalty subtracts a flat amount per unique token; frequency
+        // penalty subtracts (count × penalty). Both iterate prev_output_ids.
+        // M5: Merge into one HashMap pass to halve iteration overhead.
+        if (params.presence_penalty != 0.0 || params.frequency_penalty != 0.0)
+            && !prev_output_ids.is_empty()
+        {
+            // Single pass: build frequency map
             let mut freq: HashMap<i64, u32> = HashMap::new();
             for &id in prev_output_ids {
                 *freq.entry(id).or_insert(0) += 1;
             }
-            for (id, count) in freq {
-                let idx = id as usize;
+            // Apply both penalties from the same map
+            for (id, count) in &freq {
+                let idx = *id as usize;
                 if idx < scores.len() {
-                    scores[idx] -= (count as f32) * params.frequency_penalty;
+                    // Frequency penalty scales with count
+                    scores[idx] -= (*count as f32) * params.frequency_penalty;
+                    // Presence penalty applies once per unique token
+                    if params.presence_penalty != 0.0 {
+                        scores[idx] -= params.presence_penalty;
+                    }
                 }
             }
         }
@@ -169,7 +167,8 @@ impl Sampler {
                 .enumerate()
                 .map(|(i, p)| (p, i))
                 .collect();
-            // NOTE: sorts entire vocab. M5 optimization: select_nth_unstable + partial sort.
+            // M5: sorts entire vocab (O(n log n)). Optimize with
+            // select_nth_unstable + partial sort for 128k vocab.
             indexed.sort_unstable_by(|a, b| {
                 b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
             });

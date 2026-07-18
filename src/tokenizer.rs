@@ -186,23 +186,26 @@ impl Tokenizer {
 /// GPT-2 tokenizer encodes bytes 0-255 as characters (including
 /// unprintable ones), plus uses 'Ġ' (U+0120) to represent spaces.
 fn byte_level_decode(token: &str) -> Vec<u8> {
-    let bytes: Vec<u8> = token
-        .chars()
-        .flat_map(|ch| {
-            let code = ch as u32;
-            if code == 0x0120 {
-                // 'Ġ' → space (byte 32)
-                Some(32u8)
-            } else if code < 256 {
-                Some(code as u8)
-            } else {
-                // Multi-byte character — encode as UTF-8
-                let mut buf = [0u8; 4];
-                let _len = ch.encode_utf8(&mut buf).len();
-                Some(buf[0]) // This is a fallback; multi-byte in vocab is rare
-            }
-        })
-        .collect();
+    let mut bytes = Vec::with_capacity(token.len());
+    for ch in token.chars() {
+        let code = ch as u32;
+        if code == 0x0120 {
+            // 'Ġ' (U+0120) → space (byte 32)
+            bytes.push(32u8);
+        } else if code < 256 {
+            // Bytes 0–255 map directly to single-byte values.
+            // This is the common case for GPT-2 / LLaMA byte-level BPE.
+            bytes.push(code as u8);
+        } else {
+            // Multi-byte Unicode character (code > 255).
+            // For strictly byte-level BPE this shouldn't appear in the
+            // vocabulary, but handle it gracefully by emitting the full
+            // UTF-8 encoding rather than silently truncating to one byte.
+            let mut buf = [0u8; 4];
+            let len = ch.encode_utf8(&mut buf).len();
+            bytes.extend_from_slice(&buf[..len]);
+        }
+    }
     bytes
 }
 
@@ -265,5 +268,20 @@ mod tests {
         // "Ġworld" is space (32) + 'w', 'o', 'r', 'l', 'd'
         let tokens = &[72_i64, 101, 108, 108, 111]; // H, e, l, l, o
         assert_eq!(t.decode(tokens), "Hello");
+    }
+
+    #[test]
+    fn byte_level_decode_multi_byte_unicode() {
+        // Chinese character '中' (U+4E2D) encoded as UTF-8: E4 B8 AD
+        // If it somehow appears in a byte-level vocab, it should be preserved
+        // as the full UTF-8 byte sequence, not truncated to a single byte.
+        let bytes = byte_level_decode("中");
+        assert_eq!(bytes, vec![0xE4, 0xB8, 0xAD],
+            "multi-byte char should emit full UTF-8 sequence");
+
+        // Emoji '🚀' (U+1F680) — 4-byte UTF-8: F0 9F 9A 80
+        let bytes = byte_level_decode("🚀");
+        assert_eq!(bytes, vec![0xF0, 0x9F, 0x9A, 0x80],
+            "4-byte char should emit full UTF-8 sequence");
     }
 }
