@@ -20,6 +20,20 @@ pub trait ModelRunner: Send {
     /// 丢弃 seq 的执行侧状态（被抢占 / 完成 / 取消时调用）。
     /// 例如 PyModelRunner 要释放该 seq 的 past_key_values。
     fn drop_state(&mut self, _request_id: &str) {}
+
+    /// Tokenize a chat conversation into token ids.
+    /// Default returns an error for runners that don't support chat tokenization.
+    fn tokenize_chat(&self, messages: &[(String, String)]) -> Result<Vec<i64>, ZealotError> {
+        let _ = messages;
+        Err(ZealotError::Internal(
+            "tokenize_chat not implemented for this runner".into(),
+        ))
+    }
+
+    /// Return the end-of-sequence token id used by this model.
+    fn eos_token_id(&self) -> Option<i64> {
+        None
+    }
 }
 
 pub struct StepOut {
@@ -51,16 +65,16 @@ pub struct StepResult {
     pub finished: Vec<FinishedOut>,
 }
 
-pub struct Engine<R: ModelRunner> {
+pub struct Engine {
     sched: Scheduler,
-    runner: R,
+    runner: Box<dyn ModelRunner>,
     sampler: Sampler,
     rng: rand::rngs::StdRng,
     tokenizer: Option<crate::tokenizer::Tokenizer>,
 }
 
-impl<R: ModelRunner> Engine<R> {
-    pub fn new(sched: Scheduler, runner: R) -> Self {
+impl Engine {
+    pub fn new(sched: Scheduler, runner: Box<dyn ModelRunner>) -> Self {
         Self {
             sched,
             runner,
@@ -84,12 +98,12 @@ impl<R: ModelRunner> Engine<R> {
         &mut self.sched
     }
 
-    pub fn runner(&self) -> &R {
-        &self.runner
+    pub fn runner(&self) -> &dyn ModelRunner {
+        &*self.runner
     }
 
-    pub fn runner_mut(&mut self) -> &mut R {
-        &mut self.runner
+    pub fn runner_mut(&mut self) -> &mut dyn ModelRunner {
+        &mut *self.runner
     }
 
     pub fn is_idle(&self) -> bool {
@@ -230,7 +244,7 @@ mod tests {
         }
     }
 
-    fn engine(tokens: Vec<i64>) -> Engine<ScriptRunner> {
+    fn engine(tokens: Vec<i64>) -> Engine {
         let sched = Scheduler::new(SchedulerConfig {
             max_num_seqs: 4,
             block_size: 2,
@@ -240,13 +254,13 @@ mod tests {
         .unwrap();
         Engine::new(
             sched,
-            ScriptRunner {
+            Box::new(ScriptRunner {
                 tokens: tokens.into(),
-            },
+            }),
         )
     }
 
-    fn submit(engine: &mut Engine<ScriptRunner>, id: &str, max_tokens: usize, eos: Option<i64>) {
+    fn submit(engine: &mut Engine, id: &str, max_tokens: usize, eos: Option<i64>) {
         let seq = engine
             .scheduler_mut()
             .make_sequence(id.into(), vec![1, 2], max_tokens, Priority::Medium, eos, SamplingParams::default())
@@ -345,7 +359,7 @@ mod tests {
         }
 
         let sched = Scheduler::new(SchedulerConfig::default()).unwrap();
-        let mut engine = Engine::new(sched, LogitRunner { logits });
+        let mut engine = Engine::new(sched, Box::new(LogitRunner { logits }));
         let sampling = SamplingParams { temperature: 0.0, ..Default::default() };
         let seq = engine.scheduler_mut()
             .make_sequence("r1".into(), vec![1, 2], 5, Priority::Medium, None, sampling)

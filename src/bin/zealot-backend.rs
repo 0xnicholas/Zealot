@@ -91,7 +91,7 @@ fn usage_frame(request_id: &str, prompt: usize, completion: usize, reason: &str)
 
 /// 返回 false = 收到 Shutdown，线程退出。
 fn handle_cmd(
-    engine: &mut Engine<PyModelRunner>,
+    engine: &mut Engine,
     eos: Option<i64>,
     cmd: EngineCmd,
     inflight: &mut HashMap<String, Tx>,
@@ -142,7 +142,7 @@ fn handle_cmd(
 }
 
 fn run_engine(
-    mut engine: Engine<PyModelRunner>,
+    mut engine: Engine,
     eos: Option<i64>,
     cmd_rx: std::sync::mpsc::Receiver<EngineCmd>,
 ) {
@@ -295,7 +295,7 @@ impl InferenceRuntime for ZealotBackend {
         let eos = runner.eos_token_id();
         let sched = Scheduler::new(SchedulerConfig::default())
             .map_err(|e| Status::internal(e.to_string()))?;
-        let mut engine = Engine::new(sched, runner);
+        let mut engine = Engine::new(sched, Box::new(runner));
         // Try to load tokenizer.json from model cache for Rust-side decoding
         if let Ok(tok) = Tokenizer::load(&req.model_id) {
             engine = engine.with_tokenizer(tok);
