@@ -162,17 +162,16 @@ impl CudaModelRunner {
 }
 
 fn to_vec_f32(tensor: &Bound<'_, PyAny>) -> Result<Vec<f32>, ZealotError> {
-    let cpu = tensor.call_method0("cpu")
-        .or_else(|_| Ok(tensor.to_owned()))
-        .map_err(py_err("cpu"))?;
+    let cpu = tensor.call_method0("cpu").or_else(|_| -> Result<Bound<'_, PyAny>, PyErr> { Ok(tensor.to_owned()) })
+        .map_err(|e| ZealotError::Internal(format!("cpu: {e}")))?;
     let flat = cpu
-        .call_method0("reshape")
-        .map_err(py_err("reshape"))?
-        .call_method1("__getitem__", (-1,))
-        .map_err(py_err("__getitem__"))?;
-    let list = flat.call_method0("tolist").map_err(py_err("tolist"))?;
+        .call_method1("reshape", (-1,))
+        .map_err(|e| ZealotError::Internal(format!("reshape: {e}")))?;
+    let list = flat
+        .call_method0("tolist")
+        .map_err(|e| ZealotError::Internal(format!("tolist: {e}")))?;
     list.extract::<Vec<f32>>()
-        .map_err(|e| ZealotError::Internal(format!("tolist: {e}")))
+        .map_err(|e| ZealotError::Internal(format!("extract: {e}")))
 }
 
 impl ModelRunner for CudaModelRunner {
