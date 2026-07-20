@@ -133,7 +133,14 @@ mod tests {
         let mut q = vec![1.0_f32; 2 * 1 * 2 * 4];
         let base1 = 1 * 1 * 2 * 4;
         for i in base1..q.len() { q[i] = 100.0; }
-        let k = vec![1.0_f32; 2 * 1 * 2 * 4];
+        // position-dependent k/v: pos0 gets half the dot-product sum of pos1,
+        // so different query magnitudes produce different softmax distributions
+        let k = vec![
+            1.0, 0.0, 0.0, 0.0,
+            1.0, 1.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0,
+            1.0, 1.0, 0.0, 0.0,
+        ];
         let v = k.clone();
         let out = attn.forward(&q, &k, &v, &batch).unwrap();
         let o0 = &out[0..8];

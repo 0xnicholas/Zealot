@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 pub mod block_manager;
+pub mod attention;
 mod constrained_decode;
 pub mod engine;
 pub mod error;
