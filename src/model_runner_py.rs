@@ -45,9 +45,9 @@ impl PyModelRunner {
                     .map_err(py_err("sys.path.insert"))?;
             }
 
-            let torch = py.import("torch").map_err(py_err(
-                "import torch (venv? set ZEALOT_SITE_PACKAGES)",
-            ))?;
+            let torch = py
+                .import("torch")
+                .map_err(py_err("import torch (venv? set ZEALOT_SITE_PACKAGES)"))?;
             let transformers = py
                 .import("transformers")
                 .map_err(py_err("import transformers"))?;
@@ -70,7 +70,8 @@ impl PyModelRunner {
 
             let eos_token_id: Option<i64> = tokenizer
                 .getattr("eos_token_id")
-                .and_then(|v| v.extract()).ok();
+                .and_then(|v| v.extract())
+                .ok();
 
             Ok(Self {
                 torch: torch.unbind().into(),
@@ -105,7 +106,9 @@ impl PyModelRunner {
                 .set_item("add_generation_prompt", true)
                 .map_err(py_err("kw"))?;
             match tokenizer.call_method("apply_chat_template", (list,), Some(&kwargs)) {
-                Ok(ids) => ids.extract::<Vec<i64>>().map_err(py_err("chat_template ids")),
+                Ok(ids) => ids
+                    .extract::<Vec<i64>>()
+                    .map_err(py_err("chat_template ids")),
                 Err(_) => {
                     // 无 chat template 的模型：纯文本拼接
                     let text = messages
@@ -180,9 +183,9 @@ impl ModelRunner for PyModelRunner {
 
                 outs.push(StepOut {
                     request_id: seq.request_id.clone(),
-                    token: None,     // Let Engine's Sampler decide
+                    token: None, // Let Engine's Sampler decide
                     logits: Some(logits_list),
-                    text: None,      // Detokenization happens post-sampling (future: Rust tokenizer)
+                    text: None, // Detokenization happens post-sampling (future: Rust tokenizer)
                 });
             }
             Ok(outs)

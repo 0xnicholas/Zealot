@@ -70,7 +70,11 @@ impl Tokenizer {
             .ok_or_else(|| "tokenizer.json missing model.vocab".to_string())?;
 
         // Determine if byte-level BPE (GPT-2 family uses byte-level)
-        let model_type = parsed.model.as_ref().and_then(|m| m._type.as_deref()).unwrap_or("");
+        let model_type = parsed
+            .model
+            .as_ref()
+            .and_then(|m| m._type.as_deref())
+            .unwrap_or("");
         let is_byte_level = model_type == "BPE";
         let is_gpt2 = vocab.values().any(|&id| id == 0) && vocab.contains_key("!");
 
@@ -242,11 +246,7 @@ mod tests {
     #[test]
     fn decode_simple_word_level() {
         let t = Tokenizer {
-            id_to_token: vec![
-                Some("Hello".into()),
-                Some("world".into()),
-                Some("!".into()),
-            ],
+            id_to_token: vec![Some("Hello".into()), Some("world".into()), Some("!".into())],
             is_byte_level: false,
         };
         assert_eq!(t.decode(&[0, 1, 2]), "Hello world!");
@@ -276,12 +276,18 @@ mod tests {
         // If it somehow appears in a byte-level vocab, it should be preserved
         // as the full UTF-8 byte sequence, not truncated to a single byte.
         let bytes = byte_level_decode("中");
-        assert_eq!(bytes, vec![0xE4, 0xB8, 0xAD],
-            "multi-byte char should emit full UTF-8 sequence");
+        assert_eq!(
+            bytes,
+            vec![0xE4, 0xB8, 0xAD],
+            "multi-byte char should emit full UTF-8 sequence"
+        );
 
         // Emoji '🚀' (U+1F680) — 4-byte UTF-8: F0 9F 9A 80
         let bytes = byte_level_decode("🚀");
-        assert_eq!(bytes, vec![0xF0, 0x9F, 0x9A, 0x80],
-            "4-byte char should emit full UTF-8 sequence");
+        assert_eq!(
+            bytes,
+            vec![0xF0, 0x9F, 0x9A, 0x80],
+            "4-byte char should emit full UTF-8 sequence"
+        );
     }
 }

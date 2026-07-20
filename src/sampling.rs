@@ -142,10 +142,7 @@ impl Sampler {
                 // Use select_nth_unstable_by on INDEXED values to find threshold
                 // without reordering the original scores array (which would break
                 // the index→token mapping).
-                let mut indexed: Vec<(usize, f32)> = scores.iter()
-                    .copied()
-                    .enumerate()
-                    .collect();
+                let mut indexed: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
                 indexed.select_nth_unstable_by(k - 1, |a, b| {
                     b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                 });
@@ -223,9 +220,7 @@ fn argmax(slice: &[f32]) -> (i64, f32) {
 
 /// Compute log-probability of `max_idx` without allocating a full softmax vector.
 fn lightweight_logprob(logits: &[f32], max_idx: i64) -> f32 {
-    let max = logits
-        .iter()
-        .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
     let sum_exp: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
     let prob = (logits[max_idx as usize] - max).exp() / sum_exp;
     prob.ln()
@@ -241,13 +236,7 @@ pub fn softmax(scores: &[f32]) -> Vec<f32> {
 
     let mut probs: Vec<f32> = scores
         .iter()
-        .map(|&s| {
-            if s.is_finite() {
-                (s - max).exp()
-            } else {
-                0.0
-            }
-        })
+        .map(|&s| if s.is_finite() { (s - max).exp() } else { 0.0 })
         .collect();
 
     let sum: f32 = probs.iter().sum();
@@ -278,8 +267,8 @@ fn sample_multinomial(probs: &[f32], rng: &mut impl Rng) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     fn rng() -> StdRng {
         StdRng::seed_from_u64(42)
@@ -300,11 +289,13 @@ mod tests {
         };
         // Run 10 times — should always return the same argmax (index 4 = 100.0)
         for _ in 0..10 {
-            let result = sampler
-                .sample(&logits, &[], &params, &mut rng())
-                .unwrap();
+            let result = sampler.sample(&logits, &[], &params, &mut rng()).unwrap();
             assert_eq!(result.token_id, 4);
-            assert!(result.logprob <= 0.0, "logprob should be non-positive: {}", result.logprob);
+            assert!(
+                result.logprob <= 0.0,
+                "logprob should be non-positive: {}",
+                result.logprob
+            );
         }
     }
 
@@ -381,7 +372,11 @@ mod tests {
         for _ in 0..20 {
             let result = sampler.sample(&logits, &[], &params, &mut rng()).unwrap();
             // Only tokens 97, 98, 99 can be returned (top 3)
-            assert!(result.token_id >= 97, "token {} outside top-3", result.token_id);
+            assert!(
+                result.token_id >= 97,
+                "token {} outside top-3",
+                result.token_id
+            );
         }
     }
 
@@ -452,7 +447,10 @@ mod tests {
         let result = sampler.sample(&logits, &prev, &params, &mut rng()).unwrap();
         // After penalty: token 1 = 100 - 8*30 = -140, others stay at 1.0
         // So token 1 should NOT be chosen
-        assert_ne!(result.token_id, 1, "heavily penalized token should not be chosen");
+        assert_ne!(
+            result.token_id, 1,
+            "heavily penalized token should not be chosen"
+        );
     }
 
     #[test]
@@ -466,9 +464,7 @@ mod tests {
             ..Default::default()
         };
         // token 1: 15.0 - 10.0 = 5.0 (now below token 3 = 12.0)
-        let result = sampler
-            .sample(&logits, &prev, &params, &mut rng())
-            .unwrap();
+        let result = sampler.sample(&logits, &prev, &params, &mut rng()).unwrap();
         assert_ne!(result.token_id, 1, "penalized seen token should be avoided");
     }
 
@@ -522,9 +518,7 @@ mod tests {
             presence_penalty: 0.3,
             seed: None,
         };
-        let result = sampler
-            .sample(&logits, &prev, &params, &mut rng())
-            .unwrap();
+        let result = sampler.sample(&logits, &prev, &params, &mut rng()).unwrap();
         assert!(result.token_id < 100);
         assert!(result.logprob <= 0.0);
     }

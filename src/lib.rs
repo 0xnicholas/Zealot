@@ -1,11 +1,11 @@
 use pyo3::prelude::*;
 
-pub mod block_manager;
 pub mod attention;
-pub mod model_runner_cuda;
+pub mod block_manager;
 mod constrained_decode;
 pub mod engine;
 pub mod error;
+pub mod model_runner_cuda;
 pub mod model_runner_py;
 pub mod sampling;
 pub mod scheduler;

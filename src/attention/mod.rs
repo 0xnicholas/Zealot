@@ -38,47 +38,53 @@ impl AttentionBackend for CpuAttention {
             )));
         }
 
-        let H = batch.num_heads;
-        let D = batch.head_dim;
-        let S = batch.max_seq_len;
-        let scale = 1.0_f32 / (D as f32).sqrt();
+        let n_heads = batch.num_heads;
+        let d_head = batch.head_dim;
+        let n_pos = batch.max_seq_len;
+        let scale = 1.0_f32 / (d_head as f32).sqrt();
         let mut output = vec![0.0_f32; expected];
 
         for s in 0..batch.num_seqs {
-            for h in 0..H {
-                let base = ((s * H + h) * S) * D;
-                let q = &query[base..base + S * D];
-                let k = &key[base..base + S * D];
-                let v = &value[base..base + S * D];
-                let out = &mut output[base..base + S * D];
+            for h in 0..n_heads {
+                let base = ((s * n_heads + h) * n_pos) * d_head;
+                let q = &query[base..base + n_pos * d_head];
+                let k = &key[base..base + n_pos * d_head];
+                let v = &value[base..base + n_pos * d_head];
+                let out = &mut output[base..base + n_pos * d_head];
 
-                let mut scores = vec![0.0_f32; S * S];
-                for i in 0..S {
-                    for j in 0..S {
+                let mut scores = vec![0.0_f32; n_pos * n_pos];
+                for i in 0..n_pos {
+                    for j in 0..n_pos {
                         let mut dot = 0.0_f32;
-                        for d in 0..D {
-                            dot += q[i * D + d] * k[j * D + d];
+                        for d in 0..d_head {
+                            dot += q[i * d_head + d] * k[j * d_head + d];
                         }
-                        scores[i * S + j] = dot * scale;
+                        scores[i * n_pos + j] = dot * scale;
                     }
                 }
 
                 // softmax per row
-                for i in 0..S {
+                for i in 0..n_pos {
                     let mut max = f32::NEG_INFINITY;
-                    for j in 0..S { max = max.max(scores[i * S + j]); }
+                    for j in 0..n_pos {
+                        max = max.max(scores[i * n_pos + j]);
+                    }
                     let mut sum = 0.0_f32;
-                    for j in 0..S { sum += (scores[i * S + j] - max).exp(); }
-                    for j in 0..S { scores[i * S + j] = (scores[i * S + j] - max).exp() / sum; }
+                    for j in 0..n_pos {
+                        sum += (scores[i * n_pos + j] - max).exp();
+                    }
+                    for j in 0..n_pos {
+                        scores[i * n_pos + j] = (scores[i * n_pos + j] - max).exp() / sum;
+                    }
                 }
 
-                for i in 0..S {
-                    for d in 0..D {
+                for i in 0..n_pos {
+                    for d in 0..d_head {
                         let mut acc = 0.0_f32;
-                        for j in 0..S {
-                            acc += scores[i * S + j] * v[j * D + d];
+                        for j in 0..n_pos {
+                            acc += scores[i * n_pos + j] * v[j * d_head + d];
                         }
-                        out[i * D + d] = acc;
+                        out[i * d_head + d] = acc;
                     }
                 }
             }
@@ -106,7 +112,12 @@ mod tests {
     #[test]
     fn cpu_attention_single_seq_output_shape() {
         let mut attn = CpuAttention;
-        let batch = AttentionBatch { num_seqs: 1, num_heads: 2, head_dim: 4, max_seq_len: 3 };
+        let batch = AttentionBatch {
+            num_seqs: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 3,
+        };
         let q = vec![1.0_f32; 1 * 2 * 3 * 4];
         let k = vec![1.0_f32; 1 * 2 * 3 * 4];
         let v = vec![1.0_f32; 1 * 2 * 3 * 4];
@@ -117,7 +128,12 @@ mod tests {
     #[test]
     fn cpu_attention_returns_error_on_dimension_mismatch() {
         let mut attn = CpuAttention;
-        let batch = AttentionBatch { num_seqs: 1, num_heads: 2, head_dim: 4, max_seq_len: 3 };
+        let batch = AttentionBatch {
+            num_seqs: 1,
+            num_heads: 2,
+            head_dim: 4,
+            max_seq_len: 3,
+        };
         let q = vec![1.0_f32; 10]; // wrong size
         let k = vec![1.0_f32; 1 * 2 * 3 * 4];
         let v = vec![1.0_f32; 1 * 2 * 3 * 4];
@@ -128,24 +144,31 @@ mod tests {
     #[test]
     fn cpu_attention_multi_seq_separate_attention() {
         let mut attn = CpuAttention;
-        let batch = AttentionBatch { num_seqs: 2, num_heads: 1, head_dim: 4, max_seq_len: 2 };
+        let batch = AttentionBatch {
+            num_seqs: 2,
+            num_heads: 1,
+            head_dim: 4,
+            max_seq_len: 2,
+        };
         // seq0 q all 1, seq1 q all 100
         let mut q = vec![1.0_f32; 2 * 1 * 2 * 4];
         let base1 = 1 * 1 * 2 * 4;
-        for i in base1..q.len() { q[i] = 100.0; }
+        for i in base1..q.len() {
+            q[i] = 100.0;
+        }
         // position-dependent k/v: pos0 gets half the dot-product sum of pos1,
         // so different query magnitudes produce different softmax distributions
         let k = vec![
-            1.0, 0.0, 0.0, 0.0,
-            1.0, 1.0, 0.0, 0.0,
-            1.0, 0.0, 0.0, 0.0,
-            1.0, 1.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0,
         ];
         let v = k.clone();
         let out = attn.forward(&q, &k, &v, &batch).unwrap();
         let o0 = &out[0..8];
         let o1 = &out[8..16];
-        assert_ne!(o0, o1, "different inputs should yield different attention outputs");
+        assert_ne!(
+            o0, o1,
+            "different inputs should yield different attention outputs"
+        );
     }
 
     #[test]

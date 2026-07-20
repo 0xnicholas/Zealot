@@ -21,7 +21,11 @@ pub enum ZealotError {
     InvalidConstraint(String),
 
     #[error("Stale handle: block {block_id} was freed (gen {handle_gen}, current {current_gen})")]
-    StaleHandle { block_id: usize, handle_gen: u64, current_gen: u64 },
+    StaleHandle {
+        block_id: usize,
+        handle_gen: u64,
+        current_gen: u64,
+    },
 
     #[error("Schema too complex: {states} states exceeds limit of {limit}")]
     SchemaTooComplex { states: usize, limit: usize },

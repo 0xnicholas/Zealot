@@ -61,10 +61,16 @@ impl ConstrainedGrammar {
 
 fn count_states(gt: &GrammarType) -> usize {
     match gt {
-        GrammarType::Any | GrammarType::String { .. } | GrammarType::Number
-        | GrammarType::Integer | GrammarType::Boolean | GrammarType::Null => 1,
+        GrammarType::Any
+        | GrammarType::String { .. }
+        | GrammarType::Number
+        | GrammarType::Integer
+        | GrammarType::Boolean
+        | GrammarType::Null => 1,
         GrammarType::Object { properties, .. } => 1 + properties.len(),
-        GrammarType::Array { item_type, .. } => 1 + item_type.as_ref().map(|t| count_states(t)).unwrap_or(0),
+        GrammarType::Array { item_type, .. } => {
+            1 + item_type.as_ref().map(|t| count_states(t)).unwrap_or(0)
+        }
         GrammarType::Enum { values } => values.len().max(1),
         GrammarType::Union { branches } => branches.iter().map(count_states).sum(),
     }
@@ -121,11 +127,16 @@ impl ConstrainedGrammar {
                 // All common tokens: whitespace, punctuation, alphanumerics
                 (32..=126).collect()
             }
-            GrammarType::String { min_length, max_length: _, pattern: _, enum_values } => {
+            GrammarType::String {
+                min_length,
+                max_length: _,
+                pattern: _,
+                enum_values,
+            } => {
                 let mut tokens: Vec<i32> = vec![34]; // opening quote
                 if *min_length > 0 {
                     tokens.extend(65..=122); // A-Z, a-z
-                    tokens.extend(48..=57);   // 0-9
+                    tokens.extend(48..=57); // 0-9
                 }
                 tokens.push(34); // closing quote
                 if let Some(enums) = enum_values {
@@ -150,14 +161,18 @@ impl ConstrainedGrammar {
             }
             GrammarType::Boolean => {
                 vec![
-                    't' as i32, 'r' as i32, 'u' as i32, 'e' as i32,
-                    'f' as i32, 'a' as i32, 'l' as i32, 's' as i32, 'e' as i32,
+                    't' as i32, 'r' as i32, 'u' as i32, 'e' as i32, 'f' as i32, 'a' as i32,
+                    'l' as i32, 's' as i32, 'e' as i32,
                 ]
             }
             GrammarType::Null => {
                 vec!['n' as i32, 'u' as i32, 'l' as i32, 'l' as i32]
             }
-            GrammarType::Object { properties, required: _, additional_properties: _ } => {
+            GrammarType::Object {
+                properties,
+                required: _,
+                additional_properties: _,
+            } => {
                 let mut tokens = vec!['{' as i32, '}' as i32, ',' as i32, ':' as i32, '"' as i32];
                 tokens.extend(32..=126);
                 for key in properties.keys() {
@@ -165,7 +180,11 @@ impl ConstrainedGrammar {
                 }
                 tokens
             }
-            GrammarType::Array { min_items: _, max_items: _, item_type: _ } => {
+            GrammarType::Array {
+                min_items: _,
+                max_items: _,
+                item_type: _,
+            } => {
                 vec!['[' as i32, ']' as i32, ',' as i32]
             }
             GrammarType::Enum { values } => {
@@ -205,7 +224,11 @@ impl ConstrainedGrammar {
             GrammarType::Boolean | GrammarType::Null => {
                 true // state 0 = valid final (word complete)
             }
-            GrammarType::Object { required, properties, .. } => {
+            GrammarType::Object {
+                required,
+                properties,
+                ..
+            } => {
                 // Valid if all required properties are accounted for
                 // State 0 represents the object root — valid if no required props remain
                 required.is_empty() || properties.is_empty()
@@ -216,12 +239,10 @@ impl ConstrainedGrammar {
             GrammarType::Enum { .. } => {
                 true // at state 0, any enum value is valid
             }
-            GrammarType::Union { branches } => {
-                branches.iter().any(|b| {
-                    let g = ConstrainedGrammar::new(b.clone());
-                    g.compute_is_valid_final(0)
-                })
-            }
+            GrammarType::Union { branches } => branches.iter().any(|b| {
+                let g = ConstrainedGrammar::new(b.clone());
+                g.compute_is_valid_final(0)
+            }),
         }
     }
 }
@@ -262,12 +283,15 @@ mod tests {
     #[test]
     fn test_object_allows_brace() {
         let mut props = HashMap::new();
-        props.insert("name".to_string(), GrammarType::String {
-            min_length: 1,
-            max_length: None,
-            pattern: None,
-            enum_values: None,
-        });
+        props.insert(
+            "name".to_string(),
+            GrammarType::String {
+                min_length: 1,
+                max_length: None,
+                pattern: None,
+                enum_values: None,
+            },
+        );
         let g = ConstrainedGrammar::new(GrammarType::Object {
             properties: props,
             required: vec!["name".to_string()],

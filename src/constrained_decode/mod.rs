@@ -1,9 +1,9 @@
 pub mod matcher;
 pub mod schema;
 
-use pyo3::prelude::*;
-use self::schema::JsonSchemaCompiler;
 use self::matcher::ConstrainedGrammar;
+use self::schema::JsonSchemaCompiler;
+use pyo3::prelude::*;
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<JsonSchemaCompiler>()?;

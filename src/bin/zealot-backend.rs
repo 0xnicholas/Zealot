@@ -30,13 +30,13 @@ mod runtime_v1 {
 }
 
 use runtime_v1::{
+    infer_response::Payload,
     inference_runtime_server::{InferenceRuntime, InferenceRuntimeServer},
-    infer_response::Payload, BatchRequest, BatchResponse, BatchStatusRequest,
-    BatchStatusResponse, FinalResponse, HealthCheckRequest, HealthCheckResponse,
-    InferRequest, InferResponse, ListModelsRequest, ListModelsResponse,
-    LoadModelRequest, LoadModelResponse, LoadedModel, MetricsSnapshot,
-    StreamControl, StreamDelta, UnloadModelRequest, UnloadModelResponse, Usage,
-    Status as HealthStatus,
+    BatchRequest, BatchResponse, BatchStatusRequest, BatchStatusResponse, FinalResponse,
+    HealthCheckRequest, HealthCheckResponse, InferRequest, InferResponse, ListModelsRequest,
+    ListModelsResponse, LoadModelRequest, LoadModelResponse, LoadedModel, MetricsSnapshot,
+    Status as HealthStatus, StreamControl, StreamDelta, UnloadModelRequest, UnloadModelResponse,
+    Usage,
 };
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -106,19 +106,16 @@ fn handle_cmd(
             sampling_params,
             tx,
         } => {
-            let made = engine
-                .runner()
-                .tokenize_chat(&messages)
-                .and_then(|ids| {
-                    engine.scheduler_mut().make_sequence(
-                        request_id.clone(),
-                        ids,
-                        max_tokens,
-                        priority,
-                        eos,
-                        sampling_params,
-                    )
-                });
+            let made = engine.runner().tokenize_chat(&messages).and_then(|ids| {
+                engine.scheduler_mut().make_sequence(
+                    request_id.clone(),
+                    ids,
+                    max_tokens,
+                    priority,
+                    eos,
+                    sampling_params,
+                )
+            });
             match made {
                 Ok(seq) => {
                     engine.scheduler_mut().add(seq);
@@ -142,11 +139,7 @@ fn handle_cmd(
     true
 }
 
-fn run_engine(
-    mut engine: Engine,
-    eos: Option<i64>,
-    cmd_rx: std::sync::mpsc::Receiver<EngineCmd>,
-) {
+fn run_engine(mut engine: Engine, eos: Option<i64>, cmd_rx: std::sync::mpsc::Receiver<EngineCmd>) {
     let mut inflight: HashMap<String, Tx> = HashMap::new();
     loop {
         // 先 drain 掉积压命令（取消/新请求在步间得到处理）
@@ -241,10 +234,18 @@ fn infer_params_to_sampling(params: &runtime_v1::InferParams) -> SamplingParams 
         temperature: params.temperature,
         top_k: params.top_k,
         top_p: params.top_p,
-        repetition_penalty: if params.repetition_penalty == 0.0 { 1.0 } else { params.repetition_penalty },
+        repetition_penalty: if params.repetition_penalty == 0.0 {
+            1.0
+        } else {
+            params.repetition_penalty
+        },
         frequency_penalty: params.frequency_penalty,
         presence_penalty: params.presence_penalty,
-        seed: if params.seed == 0 { None } else { Some(params.seed) },
+        seed: if params.seed == 0 {
+            None
+        } else {
+            Some(params.seed)
+        },
     }
 }
 
@@ -285,11 +286,17 @@ impl InferenceRuntime for ZealotBackend {
                 PyModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>)
             } else {
                 #[cfg(feature = "cuda")]
-                { CudaModelRunner::load_cuda(&model_id, 0).map(|r| Box::new(r) as Box<dyn ModelRunner>) }
+                {
+                    CudaModelRunner::load_cuda(&model_id, 0)
+                        .map(|r| Box::new(r) as Box<dyn ModelRunner>)
+                }
                 #[cfg(not(feature = "cuda"))]
-                { CudaModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>) }
+                {
+                    CudaModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>)
+                }
             }
-        }).await
+        })
+        .await
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
@@ -399,10 +406,7 @@ impl InferenceRuntime for ZealotBackend {
         };
 
         let request_id = if first.request_id.is_empty() {
-            format!(
-                "req-{}",
-                REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
-            )
+            format!("req-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed))
         } else {
             first.request_id
         };
@@ -425,7 +429,9 @@ impl InferenceRuntime for ZealotBackend {
             .unwrap_or_default();
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let sampling = first.params.as_ref()
+        let sampling = first
+            .params
+            .as_ref()
             .map(infer_params_to_sampling)
             .unwrap_or_default();
         cmd_tx

@@ -18,7 +18,10 @@ pub struct BlockHandle {
 impl BlockHandle {
     #[new]
     fn new(block_id: usize, generation: u64) -> Self {
-        Self { block_id, generation }
+        Self {
+            block_id,
+            generation,
+        }
     }
 
     fn __repr__(&self) -> String {

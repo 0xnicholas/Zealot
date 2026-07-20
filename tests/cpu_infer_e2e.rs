@@ -10,8 +10,8 @@ mod common;
 use std::time::Duration;
 
 use common::runtime_v1::{
-    inference_runtime_client::InferenceRuntimeClient, infer_response::Payload,
-    ListModelsRequest, LoadModelRequest,
+    infer_response::Payload, inference_runtime_client::InferenceRuntimeClient, ListModelsRequest,
+    LoadModelRequest,
 };
 use common::{spawn_backend, stream_start_chat};
 use tokio_stream::StreamExt;

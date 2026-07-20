@@ -3,8 +3,8 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::error::ZealotError;
 use super::matcher::{ConstrainedGrammar, GrammarType};
+use crate::error::ZealotError;
 
 const MAX_NESTING_DEPTH: usize = 32;
 
@@ -29,7 +29,11 @@ impl JsonSchemaCompiler {
     }
 
     #[pyo3(signature = (schema_str, bypass_cache=None))]
-    fn compile(&self, schema_str: &str, bypass_cache: Option<bool>) -> PyResult<ConstrainedGrammar> {
+    fn compile(
+        &self,
+        schema_str: &str,
+        bypass_cache: Option<bool>,
+    ) -> PyResult<ConstrainedGrammar> {
         let hash = schema_hash(schema_str);
 
         if !bypass_cache.unwrap_or(false) {
@@ -75,9 +79,15 @@ fn schema_hash(schema_str: &str) -> u64 {
     h.finish()
 }
 
-fn compile_schema(schema: &JsonValue, max_states: usize, depth: usize) -> PyResult<ConstrainedGrammar> {
+fn compile_schema(
+    schema: &JsonValue,
+    max_states: usize,
+    depth: usize,
+) -> PyResult<ConstrainedGrammar> {
     if depth > MAX_NESTING_DEPTH {
-        return Err(ZealotError::SchemaCompileError("Maximum nesting depth exceeded".into()).into());
+        return Err(
+            ZealotError::SchemaCompileError("Maximum nesting depth exceeded".into()).into(),
+        );
     }
 
     let grammar_type = if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
@@ -104,12 +114,22 @@ fn compile_schema(schema: &JsonValue, max_states: usize, depth: usize) -> PyResu
 }
 
 fn compile_string(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyResult<GrammarType> {
-    let min_len = schema.get("minLength").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let min_len = schema
+        .get("minLength")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
     let max_len = schema.get("maxLength").and_then(|v| v.as_u64());
-    let pattern = schema.get("pattern").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let pattern = schema
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let enumerated = schema.get("enum").map(|v| {
         v.as_array()
-            .map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect::<Vec<_>>())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
     });
 
@@ -122,7 +142,8 @@ fn compile_string(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyRe
 }
 
 fn compile_enum(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyResult<GrammarType> {
-    let values = schema.get("enum")
+    let values = schema
+        .get("enum")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
@@ -131,7 +152,8 @@ fn compile_enum(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyResu
 }
 
 fn compile_object(schema: &JsonValue, max_states: usize, depth: usize) -> PyResult<GrammarType> {
-    let properties = schema.get("properties")
+    let properties = schema
+        .get("properties")
         .and_then(|v| v.as_object())
         .map(|props| {
             let mut prop_grammars = HashMap::new();
@@ -144,12 +166,18 @@ fn compile_object(schema: &JsonValue, max_states: usize, depth: usize) -> PyResu
         })
         .unwrap_or_default();
 
-    let required: Vec<String> = schema.get("required")
+    let required: Vec<String> = schema
+        .get("required")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let additional_properties = schema.get("additionalProperties")
+    let additional_properties = schema
+        .get("additionalProperties")
         .map(|v| v.as_bool().unwrap_or(true))
         .unwrap_or(true);
 
@@ -158,7 +186,8 @@ fn compile_object(schema: &JsonValue, max_states: usize, depth: usize) -> PyResu
         return Err(ZealotError::SchemaTooComplex {
             states: state_count,
             limit: max_states,
-        }.into());
+        }
+        .into());
     }
 
     Ok(GrammarType::Object {
@@ -172,7 +201,8 @@ fn compile_array(schema: &JsonValue, max_states: usize, depth: usize) -> PyResul
     let min_items = schema.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let max_items = schema.get("maxItems").and_then(|v| v.as_u64());
 
-    let item_grammar = schema.get("items")
+    let item_grammar = schema
+        .get("items")
         .map(|items| compile_schema(items, max_states, depth + 1))
         .transpose()?;
 
@@ -184,7 +214,8 @@ fn compile_array(schema: &JsonValue, max_states: usize, depth: usize) -> PyResul
 }
 
 fn compile_union(schema: &JsonValue, max_states: usize, depth: usize) -> PyResult<GrammarType> {
-    let branches = schema.get("anyOf")
+    let branches = schema
+        .get("anyOf")
         .or_else(|| schema.get("oneOf"))
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -215,7 +246,12 @@ mod tests {
         let compiler = JsonSchemaCompiler::new(16, 10000, 500);
         let schema = r#"{"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}, "required": ["name"]}"#;
         let grammar = compiler.compile(schema, None).unwrap();
-        if let GrammarType::Object { properties, required, .. } = &grammar.grammar_type {
+        if let GrammarType::Object {
+            properties,
+            required,
+            ..
+        } = &grammar.grammar_type
+        {
             assert_eq!(required.len(), 1);
             assert_eq!(required[0], "name");
             assert!(properties.contains_key("name"));

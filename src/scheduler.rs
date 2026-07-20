@@ -270,11 +270,25 @@ impl Scheduler {
         // ── 2. 为 prefilling + decoding 补齐 block ────────────────────────
         let mut i = 0;
         while i < self.prefilling.len() {
-            i = Self::ensure_blocks(&mut self.prefilling, &self.cfg, &mut self.bm, &mut self.waiting, i, &mut preempted) + 1;
+            i = Self::ensure_blocks(
+                &mut self.prefilling,
+                &self.cfg,
+                &mut self.bm,
+                &mut self.waiting,
+                i,
+                &mut preempted,
+            ) + 1;
         }
         let mut i = 0;
         while i < self.decoding.len() {
-            i = Self::ensure_blocks(&mut self.decoding, &self.cfg, &mut self.bm, &mut self.waiting, i, &mut preempted) + 1;
+            i = Self::ensure_blocks(
+                &mut self.decoding,
+                &self.cfg,
+                &mut self.bm,
+                &mut self.waiting,
+                i,
+                &mut preempted,
+            ) + 1;
         }
 
         // ── 3. 组装批次 ──────────────────────────────────────────────────
@@ -282,10 +296,7 @@ impl Scheduler {
         let decoding = &mut self.decoding;
         let batch: Vec<&mut Sequence> = prefilling.iter_mut().chain(decoding.iter_mut()).collect();
 
-        ScheduleOutput {
-            batch,
-            preempted,
-        }
+        ScheduleOutput { batch, preempted }
     }
 
     /// 确保 queue[idx] 的 block 数覆盖其当前长度。
@@ -330,7 +341,7 @@ impl Scheduler {
                         }
                         None => break, // 只剩自己，等下一轮
                     }
-                },
+                }
             }
         }
         idx
@@ -338,14 +349,22 @@ impl Scheduler {
 
     /// 完成：从 prefilling 或 decoding 队列移除并释放全部 block。
     pub fn finish(&mut self, request_id: &str) -> Option<(usize, usize)> {
-        if let Some(idx) = self.prefilling.iter().position(|s| s.request_id == request_id) {
+        if let Some(idx) = self
+            .prefilling
+            .iter()
+            .position(|s| s.request_id == request_id)
+        {
             let mut seq = self.prefilling.remove(idx);
             for h in std::mem::take(&mut seq.blocks) {
                 self.bm.try_free(&h).expect("owned handle");
             }
             return Some((seq.prompt_tokens.len(), seq.output_tokens.len()));
         }
-        if let Some(idx) = self.decoding.iter().position(|s| s.request_id == request_id) {
+        if let Some(idx) = self
+            .decoding
+            .iter()
+            .position(|s| s.request_id == request_id)
+        {
             let mut seq = self.decoding.remove(idx);
             for h in std::mem::take(&mut seq.blocks) {
                 self.bm.try_free(&h).expect("owned handle");
@@ -357,7 +376,11 @@ impl Scheduler {
 
     /// 将指定 seq 从 prefilling 移至 decoding（Engine 在 prefill 完成后调用）
     pub fn promote_to_decoding(&mut self, request_id: &str) {
-        if let Some(idx) = self.prefilling.iter().position(|s| s.request_id == request_id) {
+        if let Some(idx) = self
+            .prefilling
+            .iter()
+            .position(|s| s.request_id == request_id)
+        {
             let mut seq = self.prefilling.remove(idx);
             seq.prefill_pending = false;
             self.decoding.push(seq);
@@ -408,7 +431,14 @@ mod tests {
         priority: Priority,
     ) {
         let seq = sched
-            .make_sequence(id.into(), vec![1; prompt_len], max_tokens, priority, None, SamplingParams::default())
+            .make_sequence(
+                id.into(),
+                vec![1; prompt_len],
+                max_tokens,
+                priority,
+                None,
+                SamplingParams::default(),
+            )
             .unwrap();
         sched.add(seq);
     }
@@ -452,7 +482,14 @@ mod tests {
         let mut sched = Scheduler::new(cfg(8, 2, 2)).unwrap();
         // prompt 2 + max_tokens 8 = 10 token → 5 block > 池 2
         let err = sched
-            .make_sequence("huge".into(), vec![1; 2], 8, Priority::Medium, None, SamplingParams::default())
+            .make_sequence(
+                "huge".into(),
+                vec![1; 2],
+                8,
+                Priority::Medium,
+                None,
+                SamplingParams::default(),
+            )
             .unwrap_err();
         assert!(matches!(err, ZealotError::SequenceTooLong { .. }));
     }
@@ -471,11 +508,7 @@ mod tests {
         // A 生成 2 token：len 4→6，需要 3 block（原占 2）→ 补 1 → 池空
         {
             let mut out = sched.schedule();
-            let a = out
-                .batch
-                .iter_mut()
-                .find(|s| s.request_id == "a")
-                .unwrap();
+            let a = out.batch.iter_mut().find(|s| s.request_id == "a").unwrap();
             a.output_tokens.push(10);
             a.output_tokens.push(11);
             a.mark_prefilled();
@@ -488,11 +521,7 @@ mod tests {
         // B 补 1 block。0 → +3 → B 占 1 → 空闲 2。
         {
             let mut out = sched.schedule();
-            let b = out
-                .batch
-                .iter_mut()
-                .find(|s| s.request_id == "b")
-                .unwrap();
+            let b = out.batch.iter_mut().find(|s| s.request_id == "b").unwrap();
             b.output_tokens.push(20);
             b.mark_prefilled();
         }

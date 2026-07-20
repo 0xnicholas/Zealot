@@ -21,6 +21,7 @@ struct KvCache {
     head_dim: usize,
 }
 
+#[allow(dead_code)]
 pub struct CudaModelRunner {
     attn: Box<dyn AttentionBackend>,
     #[allow(dead_code)]
@@ -71,9 +72,11 @@ impl CudaModelRunner {
                     .map_err(py_err("sys.path.insert"))?;
             }
 
-            let _torch = py.import("torch")
+            let _torch = py
+                .import("torch")
                 .map_err(py_err("import torch (venv? set ZEALOT_SITE_PACKAGES)"))?;
-            let transformers = py.import("transformers")
+            let transformers = py
+                .import("transformers")
                 .map_err(py_err("import transformers"))?;
 
             let tokenizer = transformers
@@ -87,19 +90,37 @@ impl CudaModelRunner {
                 .call_method1("from_pretrained", (model_id,))
                 .map_err(py_err("model from_pretrained"))?;
 
-            let eos_token_id: Option<i64> =
-                tokenizer.getattr("eos_token_id").and_then(|v| v.extract()).ok();
+            let eos_token_id: Option<i64> = tokenizer
+                .getattr("eos_token_id")
+                .and_then(|v| v.extract())
+                .ok();
 
             let config = model.getattr("config").map_err(py_err("model.config"))?;
-            let hidden_dim: usize = config.getattr("hidden_size").map_err(py_err("hidden_size"))?.extract().map_err(py_err("hidden_size"))?;
-            let num_heads: usize = config.getattr("num_attention_heads").map_err(py_err("num_attention_heads"))?.extract().map_err(py_err("num_attention_heads"))?;
+            let hidden_dim: usize = config
+                .getattr("hidden_size")
+                .map_err(py_err("hidden_size"))?
+                .extract()
+                .map_err(py_err("hidden_size"))?;
+            let num_heads: usize = config
+                .getattr("num_attention_heads")
+                .map_err(py_err("num_attention_heads"))?
+                .extract()
+                .map_err(py_err("num_attention_heads"))?;
             let head_dim: usize = hidden_dim / num_heads;
-            let num_layers: usize = config.getattr("num_hidden_layers").map_err(py_err("num_hidden_layers"))?.extract().map_err(py_err("num_hidden_layers"))?;
+            let num_layers: usize = config
+                .getattr("num_hidden_layers")
+                .map_err(py_err("num_hidden_layers"))?
+                .extract()
+                .map_err(py_err("num_hidden_layers"))?;
 
             let wte = model
                 .getattr("transformer")
                 .and_then(|t| t.getattr("wte"))
-                .or_else(|_| model.getattr("model").and_then(|m| m.getattr("embed_tokens")))
+                .or_else(|_| {
+                    model
+                        .getattr("model")
+                        .and_then(|m| m.getattr("embed_tokens"))
+                })
                 .map_err(py_err("embed_tokens"))?
                 .getattr("weight")
                 .map_err(py_err("weight"))?;
@@ -113,10 +134,15 @@ impl CudaModelRunner {
                     .or_else(|_| model.getattr("model").and_then(|m| m.getattr("layers")))
                     .map_err(py_err("layers"))?;
                 let l0 = layer.get_item(0).map_err(py_err("layer[0]"))?;
-                let attn = l0.getattr("attn")
+                let attn = l0
+                    .getattr("attn")
                     .or_else(|_| l0.getattr("self_attn").or_else(|_| l0.getattr("attention")))
                     .map_err(py_err("attn"))?;
-                let w = attn.getattr(suffix).map_err(py_err("qkv suffix"))?.getattr("weight").map_err(py_err("weight"))?;
+                let w = attn
+                    .getattr(suffix)
+                    .map_err(py_err("qkv suffix"))?
+                    .getattr("weight")
+                    .map_err(py_err("weight"))?;
                 to_vec_f32(&w)
             };
 
@@ -162,7 +188,9 @@ impl CudaModelRunner {
 }
 
 fn to_vec_f32(tensor: &Bound<'_, PyAny>) -> Result<Vec<f32>, ZealotError> {
-    let cpu = tensor.call_method0("cpu").or_else(|_| -> Result<Bound<'_, PyAny>, PyErr> { Ok(tensor.to_owned()) })
+    let cpu = tensor
+        .call_method0("cpu")
+        .or_else(|_| -> Result<Bound<'_, PyAny>, PyErr> { Ok(tensor.to_owned()) })
         .map_err(|e| ZealotError::Internal(format!("cpu: {e}")))?;
     let flat = cpu
         .call_method1("reshape", (-1,))
@@ -186,20 +214,26 @@ impl ModelRunner for CudaModelRunner {
             for (role, content) in messages {
                 let d = PyDict::new(py);
                 d.set_item("role", role).map_err(py_err("msg role"))?;
-                d.set_item("content", content).map_err(py_err("msg content"))?;
+                d.set_item("content", content)
+                    .map_err(py_err("msg content"))?;
                 list.append(d).map_err(py_err("msg append"))?;
             }
             let kwargs = PyDict::new(py);
             kwargs.set_item("tokenize", true).map_err(py_err("kw"))?;
-            kwargs.set_item("add_generation_prompt", true).map_err(py_err("kw"))?;
+            kwargs
+                .set_item("add_generation_prompt", true)
+                .map_err(py_err("kw"))?;
             match tokenizer.call_method("apply_chat_template", (list,), Some(&kwargs)) {
-                Ok(ids) => ids.extract::<Vec<i64>>().map_err(py_err("chat_template ids")),
+                Ok(ids) => ids
+                    .extract::<Vec<i64>>()
+                    .map_err(py_err("chat_template ids")),
                 Err(_) => {
                     let text = messages
                         .iter()
                         .map(|(r, c)| format!("{r}: {c}"))
                         .collect::<Vec<_>>()
-                        .join("\n") + "\n";
+                        .join("\n")
+                        + "\n";
                     tokenizer
                         .call_method1("encode", (text,))
                         .map_err(py_err("encode"))?
@@ -225,14 +259,33 @@ impl ModelRunner for CudaModelRunner {
             for (i, &id) in token_ids.iter().enumerate() {
                 let start = id as usize * self.hidden_dim;
                 for d in 0..self.hidden_dim {
-                    embed_out[i * self.hidden_dim + d] = *self.embedding.get(start + d).unwrap_or(&0.0);
+                    embed_out[i * self.hidden_dim + d] =
+                        *self.embedding.get(start + d).unwrap_or(&0.0);
                 }
             }
 
             let proj_dim = self.num_heads * self.head_dim;
-            let q_projected = crate::attention::matmul(&embed_out, &self.q_proj, seq_len, self.hidden_dim, proj_dim);
-            let k_projected = crate::attention::matmul(&embed_out, &self.k_proj, seq_len, self.hidden_dim, proj_dim);
-            let v_projected = crate::attention::matmul(&embed_out, &self.v_proj, seq_len, self.hidden_dim, proj_dim);
+            let q_projected = crate::attention::matmul(
+                &embed_out,
+                &self.q_proj,
+                seq_len,
+                self.hidden_dim,
+                proj_dim,
+            );
+            let k_projected = crate::attention::matmul(
+                &embed_out,
+                &self.k_proj,
+                seq_len,
+                self.hidden_dim,
+                proj_dim,
+            );
+            let v_projected = crate::attention::matmul(
+                &embed_out,
+                &self.v_proj,
+                seq_len,
+                self.hidden_dim,
+                proj_dim,
+            );
 
             let h = self.num_heads;
             let d = self.head_dim;
@@ -272,10 +325,18 @@ impl ModelRunner for CudaModelRunner {
             }
 
             let attn_hidden = crate::attention::matmul(
-                &last_hidden, &self.attn_proj, 1, self.hidden_dim, self.hidden_dim,
+                &last_hidden,
+                &self.attn_proj,
+                1,
+                self.hidden_dim,
+                self.hidden_dim,
             );
             let logits = crate::attention::matmul(
-                &attn_hidden, &self.lm_head, 1, self.hidden_dim, self.vocab_size,
+                &attn_hidden,
+                &self.lm_head,
+                1,
+                self.hidden_dim,
+                self.vocab_size,
             );
 
             outs.push(StepOut {

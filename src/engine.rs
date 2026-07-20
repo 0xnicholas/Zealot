@@ -137,7 +137,8 @@ impl Engine {
         }
 
         let was_prefill: Vec<bool> = batch.iter().map(|s| s.is_prefill()).collect();
-        let prefilled_ids: Vec<String> = batch.iter()
+        let prefilled_ids: Vec<String> = batch
+            .iter()
             .filter(|s| s.is_prefill())
             .map(|s| s.request_id.clone())
             .collect();
@@ -160,7 +161,12 @@ impl Engine {
                     let seed = self.rng.gen::<u64>();
                     rand::rngs::StdRng::seed_from_u64(seed)
                 };
-                match self.sampler.sample(&logits, &seq.output_tokens, &seq.sampling_params, &mut req_rng) {
+                match self.sampler.sample(
+                    &logits,
+                    &seq.output_tokens,
+                    &seq.sampling_params,
+                    &mut req_rng,
+                ) {
                     Ok(sampled) => sampled.token_id,
                     Err(_) => 0,
                 }
@@ -169,9 +175,9 @@ impl Engine {
             };
             seq.output_tokens.push(token);
             // Decode token text if we have a Rust tokenizer, else use runner-provided text
-            let text = step_out.text.or_else(|| {
-                self.tokenizer.as_ref().and_then(|t| t.decode_single(token))
-            });
+            let text = step_out
+                .text
+                .or_else(|| self.tokenizer.as_ref().and_then(|t| t.decode_single(token)));
             result.tokens.push(TokenOut {
                 request_id: step_out.request_id,
                 token,
@@ -182,7 +188,9 @@ impl Engine {
         let finished: Vec<(String, FinishReason)> = batch
             .iter()
             .filter_map(|seq| {
-                if seq.eos_token_id.is_some() && seq.output_tokens.last() == seq.eos_token_id.as_ref() {
+                if seq.eos_token_id.is_some()
+                    && seq.output_tokens.last() == seq.eos_token_id.as_ref()
+                {
                     Some((seq.request_id.clone(), FinishReason::Stop))
                 } else if seq.output_tokens.len() >= seq.max_tokens {
                     Some((seq.request_id.clone(), FinishReason::Length))
@@ -263,7 +271,14 @@ mod tests {
     fn submit(engine: &mut Engine, id: &str, max_tokens: usize, eos: Option<i64>) {
         let seq = engine
             .scheduler_mut()
-            .make_sequence(id.into(), vec![1, 2], max_tokens, Priority::Medium, eos, SamplingParams::default())
+            .make_sequence(
+                id.into(),
+                vec![1, 2],
+                max_tokens,
+                Priority::Medium,
+                eos,
+                SamplingParams::default(),
+            )
             .unwrap();
         engine.scheduler_mut().add(seq);
     }
@@ -360,8 +375,12 @@ mod tests {
 
         let sched = Scheduler::new(SchedulerConfig::default()).unwrap();
         let mut engine = Engine::new(sched, Box::new(LogitRunner { logits }));
-        let sampling = SamplingParams { temperature: 0.0, ..Default::default() };
-        let seq = engine.scheduler_mut()
+        let sampling = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let seq = engine
+            .scheduler_mut()
             .make_sequence("r1".into(), vec![1, 2], 5, Priority::Medium, None, sampling)
             .unwrap();
         engine.scheduler_mut().add(seq);
