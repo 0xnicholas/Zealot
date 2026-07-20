@@ -18,7 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_stream::{wrappers::ReceiverStream, wrappers::TcpListenerStream, Stream};
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
-use zealot_engine::engine::Engine;
+use zealot_engine::engine::{Engine, ModelRunner};
+use zealot_engine::model_runner_cuda::CudaModelRunner;
 use zealot_engine::model_runner_py::PyModelRunner;
 use zealot_engine::sampling::SamplingParams;
 use zealot_engine::scheduler::{Priority, Scheduler, SchedulerConfig};
@@ -279,7 +280,16 @@ impl InferenceRuntime for ZealotBackend {
 
         let model_id = req.model_id.clone();
         // 加载是重阻塞操作（HF 下载 + CPU 读盘），移出 tokio 工作线程
-        let runner = match tokio::task::spawn_blocking(move || PyModelRunner::load(&model_id)).await
+        let runner: Box<dyn ModelRunner> = match tokio::task::spawn_blocking(move || {
+            if std::env::var("ZEALOT_USE_PYTHON").is_ok() {
+                PyModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>)
+            } else {
+                #[cfg(feature = "cuda")]
+                { CudaModelRunner::load_cuda(&model_id, 0).map(|r| Box::new(r) as Box<dyn ModelRunner>) }
+                #[cfg(not(feature = "cuda"))]
+                { CudaModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>) }
+            }
+        }).await
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
@@ -295,7 +305,7 @@ impl InferenceRuntime for ZealotBackend {
         let eos = runner.eos_token_id();
         let sched = Scheduler::new(SchedulerConfig::default())
             .map_err(|e| Status::internal(e.to_string()))?;
-        let mut engine = Engine::new(sched, Box::new(runner));
+        let mut engine = Engine::new(sched, runner);
         // Try to load tokenizer.json from model cache for Rust-side decoding
         if let Ok(tok) = Tokenizer::load(&req.model_id) {
             engine = engine.with_tokenizer(tok);
