@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn cpu_attention_single_seq_output_shape() {
-        let attn = CpuAttention;
+        let mut attn = CpuAttention;
         let batch = AttentionBatch { num_seqs: 1, num_heads: 2, head_dim: 4, max_seq_len: 3 };
         let q = vec![1.0_f32; 1 * 2 * 3 * 4];
         let k = vec![1.0_f32; 1 * 2 * 3 * 4];
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn cpu_attention_returns_error_on_dimension_mismatch() {
-        let attn = CpuAttention;
+        let mut attn = CpuAttention;
         let batch = AttentionBatch { num_seqs: 1, num_heads: 2, head_dim: 4, max_seq_len: 3 };
         let q = vec![1.0_f32; 10]; // wrong size
         let k = vec![1.0_f32; 1 * 2 * 3 * 4];
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn cpu_attention_multi_seq_separate_attention() {
-        let attn = CpuAttention;
+        let mut attn = CpuAttention;
         let batch = AttentionBatch { num_seqs: 2, num_heads: 1, head_dim: 4, max_seq_len: 2 };
         // seq0 q all 1, seq1 q all 100
         let mut q = vec![1.0_f32; 2 * 1 * 2 * 4];
