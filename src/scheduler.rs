@@ -67,6 +67,8 @@ pub struct Sequence {
     pub sampling_params: SamplingParams,
     /// true = 下一步需要 prefill（初始，或被抢占后需 recompute）
     prefill_pending: bool,
+    prefill_pos: usize,
+    chunk_size: usize,
 }
 
 impl Sequence {
@@ -90,6 +92,8 @@ impl Sequence {
             status: SeqStatus::Waiting,
             blocks: Vec::new(),
             prefill_pending: true,
+            prefill_pos: 0,
+            chunk_size: 0,
             sampling_params,
         }
     }
@@ -97,20 +101,22 @@ impl Sequence {
     /// 总长度（prompt + 已生成）。被抢占的 seq 保留 output_tokens，
     /// 恢复时整体 recompute（vLLM recompute 语义）。
     pub fn len(&self) -> usize {
-        self.prompt_tokens.len() + self.output_tokens.len()
+        if self.prefill_pending {
+            self.prefill_pos + self.output_tokens.len() + self.chunk_size
+        } else {
+            self.prompt_tokens.len() + self.output_tokens.len()
+        }
     }
 
     /// 本步喂给 runner 的输入：prefill 为全部 token，decode 为上一步 token。
     pub fn step_input(&self) -> Vec<i64> {
         if self.prefill_pending {
-            let mut ids = self.prompt_tokens.clone();
+            let end = (self.prefill_pos + self.chunk_size).min(self.prompt_tokens.len());
+            let mut ids: Vec<i64> = self.prompt_tokens[self.prefill_pos..end].to_vec();
             ids.extend_from_slice(&self.output_tokens);
             ids
         } else {
-            vec![*self
-                .output_tokens
-                .last()
-                .expect("decode step requires generated token")]
+            vec![*self.output_tokens.last().expect("decode step requires generated token")]
         }
     }
 
@@ -120,6 +126,10 @@ impl Sequence {
 
     pub fn mark_prefilled(&mut self) {
         self.prefill_pending = false;
+    }
+
+    pub fn is_final_chunk(&self) -> bool {
+        self.prefill_pos + self.chunk_size >= self.prompt_tokens.len()
     }
 }
 
