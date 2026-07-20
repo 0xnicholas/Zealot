@@ -143,6 +143,7 @@ pub struct SchedulerConfig {
     pub num_gpu_blocks: usize,
     /// 单步 prefill 的最大 token 总数（限制 prefilling 的计算量）
     pub max_prefill_tokens: usize,
+    pub prefill_chunk_size: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -152,6 +153,7 @@ impl Default for SchedulerConfig {
             block_size: 16,
             num_gpu_blocks: 1024,
             max_prefill_tokens: 2048,
+            prefill_chunk_size: 512,
         }
     }
 }
