@@ -173,16 +173,18 @@ impl Engine {
             } else {
                 0 // No token and no logits — should not happen
             };
-            seq.output_tokens.push(token);
-            // Decode token text if we have a Rust tokenizer, else use runner-provided text
-            let text = step_out
-                .text
-                .or_else(|| self.tokenizer.as_ref().and_then(|t| t.decode_single(token)));
-            result.tokens.push(TokenOut {
-                request_id: step_out.request_id,
-                token,
-                text,
-            });
+            let is_valid_output = !seq.is_prefill() || seq.is_final_chunk();
+            if is_valid_output {
+                seq.output_tokens.push(token);
+                let text = step_out
+                    .text
+                    .or_else(|| self.tokenizer.as_ref().and_then(|t| t.decode_single(token)));
+                result.tokens.push(TokenOut {
+                    request_id: step_out.request_id,
+                    token,
+                    text,
+                });
+            }
         }
         // ── Collect stop-condition data before mutating scheduler ──────
         let finished: Vec<(String, FinishReason)> = batch
@@ -201,14 +203,13 @@ impl Engine {
             .collect();
 
         for (seq, was) in batch.iter_mut().zip(was_prefill) {
-            if was {
+            if was && seq.is_final_chunk() {
                 seq.mark_prefilled();
             }
         }
-        // batch borrow ends here — safe to mutate scheduler
         drop(batch);
         for rid in prefilled_ids {
-            self.sched.promote_to_decoding(&rid);
+            self.sched.advance_prefill(&rid);
         }
 
         for (request_id, reason) in finished {
