@@ -598,4 +598,134 @@ mod tests {
         assert_eq!(sched.free_blocks(), 4);
         assert!(sched.is_idle());
     }
+
+    #[test]
+    fn chunked_prefill_splits_long_prompt() {
+        let mut sched = Scheduler::new(SchedulerConfig {
+            max_num_seqs: 8,
+            block_size: 2,
+            num_gpu_blocks: 1024,
+            max_prefill_tokens: 512,
+            prefill_chunk_size: 256,
+        })
+        .unwrap();
+        let seq = sched
+            .make_sequence("a".into(), vec![1; 1024], 4, Priority::Medium, None, SamplingParams::default())
+            .unwrap();
+        sched.add(seq);
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 1);
+        assert!(out.batch[0].is_prefill());
+        assert!(!out.batch[0].is_final_chunk());
+        sched.advance_prefill("a");
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 1);
+        assert!(out.batch[0].is_prefill());
+        assert!(!out.batch[0].is_final_chunk());
+        sched.advance_prefill("a");
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 1);
+        assert!(out.batch[0].is_prefill());
+        assert!(!out.batch[0].is_final_chunk());
+        sched.advance_prefill("a");
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 1);
+        assert!(out.batch[0].is_prefill());
+        assert!(out.batch[0].is_final_chunk());
+        sched.advance_prefill("a");
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 1);
+        assert!(!out.batch[0].is_prefill());
+    }
+
+    #[test]
+    fn chunked_prefill_short_prompt_still_one_step() {
+        let mut sched = Scheduler::new(SchedulerConfig {
+            max_num_seqs: 8,
+            block_size: 2,
+            num_gpu_blocks: 1024,
+            max_prefill_tokens: 512,
+            prefill_chunk_size: 256,
+        })
+        .unwrap();
+        let seq = sched
+            .make_sequence("a".into(), vec![1; 128], 4, Priority::Medium, None, SamplingParams::default())
+            .unwrap();
+        sched.add(seq);
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 1);
+        assert!(out.batch[0].is_final_chunk());
+    }
+
+    #[test]
+    fn chunked_prefill_interleaves_with_decode() {
+        let mut sched = Scheduler::new(SchedulerConfig {
+            max_num_seqs: 8,
+            block_size: 2,
+            num_gpu_blocks: 1024,
+            max_prefill_tokens: 512,
+            prefill_chunk_size: 256,
+        })
+        .unwrap();
+        let seq_a = sched
+            .make_sequence("a".into(), vec![1; 512], 4, Priority::Medium, None, SamplingParams::default())
+            .unwrap();
+        let seq_b = sched
+            .make_sequence("b".into(), vec![1; 128], 4, Priority::Medium, None, SamplingParams::default())
+            .unwrap();
+        sched.add(seq_a);
+        sched.add(seq_b);
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 2);
+        let a = out.batch.iter().find(|s| s.request_id == "a").unwrap();
+        let b = out.batch.iter().find(|s| s.request_id == "b").unwrap();
+        assert!(a.is_prefill());
+        assert!(!a.is_final_chunk());
+        assert!(b.is_prefill());
+        assert!(b.is_final_chunk());
+        sched.advance_prefill("a");
+        sched.advance_prefill("b");
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 2);
+        let a = out.batch.iter().find(|s| s.request_id == "a").unwrap();
+        let b = out.batch.iter().find(|s| s.request_id == "b").unwrap();
+        assert!(a.is_prefill());
+        assert!(a.is_final_chunk());
+        assert!(!b.is_prefill());
+    }
+
+    #[test]
+    fn advance_prefill_tracks_position() {
+        let mut sched = Scheduler::new(SchedulerConfig {
+            max_num_seqs: 8,
+            block_size: 2,
+            num_gpu_blocks: 1024,
+            max_prefill_tokens: 512,
+            prefill_chunk_size: 100,
+        })
+        .unwrap();
+        let seq = sched
+            .make_sequence("a".into(), vec![1; 300], 4, Priority::Medium, None, SamplingParams::default())
+            .unwrap();
+        sched.add(seq);
+
+        sched.schedule();
+        sched.advance_prefill("a");
+        sched.schedule();
+        sched.advance_prefill("a");
+        sched.schedule();
+        sched.advance_prefill("a");
+
+        let out = sched.schedule();
+        assert_eq!(out.batch.len(), 1);
+        assert!(!out.batch[0].is_prefill(), "should be in decoding after 3 chunks complete");
+    }
 }
