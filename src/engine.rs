@@ -258,6 +258,7 @@ mod tests {
             block_size: 2,
             num_gpu_blocks: 16,
             max_prefill_tokens: 256,
+            prefill_chunk_size: 512,
         })
         .unwrap();
         Engine::new(

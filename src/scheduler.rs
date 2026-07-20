@@ -245,68 +245,64 @@ impl Scheduler {
         self.waiting.insert(pos, seq);
     }
 
-    /// 形成本步批次：
-    /// 1. 提升 waiting → prefilling（受 max_prefill_tokens 和 block 预算约束）
-    /// 2. 为 prefilling + decoding 分配/补充 block（OOM → 抢占）
-    /// 批量返回所有活跃 seq（prefilling + decoding）。
-    /// Runner 通过 seq.is_prefill() 区分阶段。
     pub fn schedule(&mut self) -> ScheduleOutput<'_> {
         let mut preempted = Vec::new();
-        let total_seqs = self.prefilling.len() + self.decoding.len();
 
-        // ── 1. 提升 waiting → prefilling ───────────────────────────────
-        //    同时受 max_num_seqs（总运行数）和 max_prefill_tokens 限制。
+        // ── 1. Reassign chunks to existing prefilling seqs ─────────
         let mut prefill_tokens = 0_usize;
+        for seq in self.prefilling.iter_mut() {
+            if seq.prefill_pending && seq.chunk_size == 0 {
+                let remaining = seq.prompt_tokens.len().saturating_sub(seq.prefill_pos);
+                let chunk = remaining.min(self.cfg.prefill_chunk_size);
+                if prefill_tokens + chunk > self.cfg.max_prefill_tokens {
+                    break;
+                }
+                seq.chunk_size = chunk;
+                prefill_tokens += chunk;
+            }
+        }
+
+        // ── 2. Promote waiting → prefilling ───────────────────────
         while let Some(seq) = self.waiting.first() {
-            if total_seqs + self.prefilling.len() >= self.cfg.max_num_seqs {
+            if self.prefilling.len() + self.decoding.len() >= self.cfg.max_num_seqs {
                 break;
             }
-            let tokens = seq.len(); // prompt + 已生成的 output_tokens
-            if prefill_tokens + tokens > self.cfg.max_prefill_tokens && prefill_tokens > 0 {
-                break; // 本步 prefill token 预算用尽，剩余的 prefill 等下一步
+            let remaining = seq.prompt_tokens.len().saturating_sub(seq.prefill_pos);
+            let chunk = remaining.min(self.cfg.prefill_chunk_size);
+            if prefill_tokens + chunk > self.cfg.max_prefill_tokens && prefill_tokens > 0 {
+                break;
             }
-            let need = blocks_for(tokens, self.cfg.block_size);
+            let total_len = seq.prefill_pos + chunk + seq.output_tokens.len();
+            let need = blocks_for(total_len, self.cfg.block_size);
             if self.bm.available() < need {
-                break; // block 不足，等 running 释放或抢占
+                break;
             }
             let mut seq = self.waiting.remove(0);
-            for _ in 0..need {
+            for _ in seq.blocks.len()..need {
                 let h = self.bm.try_allocate().expect("available checked");
                 seq.blocks.push(h);
             }
+            seq.chunk_size = chunk;
             seq.status = SeqStatus::Running;
-            prefill_tokens += tokens;
+            prefill_tokens += chunk;
             self.prefilling.push(seq);
         }
 
-        // ── 2. 为 prefilling + decoding 补齐 block ────────────────────────
+        // ── 3. Ensure blocks for prefilling + decoding ────────────
         let mut i = 0;
         while i < self.prefilling.len() {
-            i = Self::ensure_blocks(
-                &mut self.prefilling,
-                &self.cfg,
-                &mut self.bm,
-                &mut self.waiting,
-                i,
-                &mut preempted,
-            ) + 1;
+            i = Self::ensure_blocks(&mut self.prefilling, &self.cfg, &mut self.bm, &mut self.waiting, i, &mut preempted) + 1;
         }
         let mut i = 0;
         while i < self.decoding.len() {
-            i = Self::ensure_blocks(
-                &mut self.decoding,
-                &self.cfg,
-                &mut self.bm,
-                &mut self.waiting,
-                i,
-                &mut preempted,
-            ) + 1;
+            i = Self::ensure_blocks(&mut self.decoding, &self.cfg, &mut self.bm, &mut self.waiting, i, &mut preempted) + 1;
         }
 
-        // ── 3. 组装批次 ──────────────────────────────────────────────────
-        let prefilling = &mut self.prefilling;
-        let decoding = &mut self.decoding;
-        let batch: Vec<&mut Sequence> = prefilling.iter_mut().chain(decoding.iter_mut()).collect();
+        // ── 4. Assemble batch (exclude chunk_size==0 prefilling) ──
+        let batch: Vec<&mut Sequence> = self.prefilling.iter_mut()
+            .filter(|s| s.chunk_size > 0)
+            .chain(self.decoding.iter_mut())
+            .collect();
 
         ScheduleOutput { batch, preempted }
     }
@@ -432,6 +428,7 @@ mod tests {
             block_size,
             num_gpu_blocks,
             max_prefill_tokens: 1024,
+            prefill_chunk_size: 512,
         }
     }
 
