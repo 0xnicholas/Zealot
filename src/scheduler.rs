@@ -116,7 +116,10 @@ impl Sequence {
             ids.extend_from_slice(&self.output_tokens);
             ids
         } else {
-            vec![*self.output_tokens.last().expect("decode step requires generated token")]
+            vec![*self
+                .output_tokens
+                .last()
+                .expect("decode step requires generated token")]
         }
     }
 
@@ -291,15 +294,31 @@ impl Scheduler {
         // ── 3. Ensure blocks for prefilling + decoding ────────────
         let mut i = 0;
         while i < self.prefilling.len() {
-            i = Self::ensure_blocks(&mut self.prefilling, &self.cfg, &mut self.bm, &mut self.waiting, i, &mut preempted) + 1;
+            i = Self::ensure_blocks(
+                &mut self.prefilling,
+                &self.cfg,
+                &mut self.bm,
+                &mut self.waiting,
+                i,
+                &mut preempted,
+            ) + 1;
         }
         let mut i = 0;
         while i < self.decoding.len() {
-            i = Self::ensure_blocks(&mut self.decoding, &self.cfg, &mut self.bm, &mut self.waiting, i, &mut preempted) + 1;
+            i = Self::ensure_blocks(
+                &mut self.decoding,
+                &self.cfg,
+                &mut self.bm,
+                &mut self.waiting,
+                i,
+                &mut preempted,
+            ) + 1;
         }
 
         // ── 4. Assemble batch (exclude chunk_size==0 prefilling) ──
-        let batch: Vec<&mut Sequence> = self.prefilling.iter_mut()
+        let batch: Vec<&mut Sequence> = self
+            .prefilling
+            .iter_mut()
             .filter(|s| s.chunk_size > 0)
             .chain(self.decoding.iter_mut())
             .collect();
@@ -400,7 +419,10 @@ impl Scheduler {
     /// Engine 在 prefill chunk 完成后调用。
     /// 递增 prefill_pos；最终 chunk 时 promote 到 decoding。
     pub fn advance_prefill(&mut self, request_id: &str) {
-        let idx = self.prefilling.iter().position(|s| s.request_id == request_id);
+        let idx = self
+            .prefilling
+            .iter()
+            .position(|s| s.request_id == request_id);
         let is_done = if let Some(idx) = idx {
             let seq = &mut self.prefilling[idx];
             seq.prefill_pos += seq.chunk_size;
@@ -610,7 +632,14 @@ mod tests {
         })
         .unwrap();
         let seq = sched
-            .make_sequence("a".into(), vec![1; 1024], 4, Priority::Medium, None, SamplingParams::default())
+            .make_sequence(
+                "a".into(),
+                vec![1; 1024],
+                4,
+                Priority::Medium,
+                None,
+                SamplingParams::default(),
+            )
             .unwrap();
         sched.add(seq);
 
@@ -654,7 +683,14 @@ mod tests {
         })
         .unwrap();
         let seq = sched
-            .make_sequence("a".into(), vec![1; 128], 4, Priority::Medium, None, SamplingParams::default())
+            .make_sequence(
+                "a".into(),
+                vec![1; 128],
+                4,
+                Priority::Medium,
+                None,
+                SamplingParams::default(),
+            )
             .unwrap();
         sched.add(seq);
 
@@ -674,10 +710,24 @@ mod tests {
         })
         .unwrap();
         let seq_a = sched
-            .make_sequence("a".into(), vec![1; 512], 4, Priority::Medium, None, SamplingParams::default())
+            .make_sequence(
+                "a".into(),
+                vec![1; 512],
+                4,
+                Priority::Medium,
+                None,
+                SamplingParams::default(),
+            )
             .unwrap();
         let seq_b = sched
-            .make_sequence("b".into(), vec![1; 128], 4, Priority::Medium, None, SamplingParams::default())
+            .make_sequence(
+                "b".into(),
+                vec![1; 128],
+                4,
+                Priority::Medium,
+                None,
+                SamplingParams::default(),
+            )
             .unwrap();
         sched.add(seq_a);
         sched.add(seq_b);
@@ -713,7 +763,14 @@ mod tests {
         })
         .unwrap();
         let seq = sched
-            .make_sequence("a".into(), vec![1; 300], 4, Priority::Medium, None, SamplingParams::default())
+            .make_sequence(
+                "a".into(),
+                vec![1; 300],
+                4,
+                Priority::Medium,
+                None,
+                SamplingParams::default(),
+            )
             .unwrap();
         sched.add(seq);
 
@@ -726,6 +783,9 @@ mod tests {
 
         let out = sched.schedule();
         assert_eq!(out.batch.len(), 1);
-        assert!(!out.batch[0].is_prefill(), "should be in decoding after 3 chunks complete");
+        assert!(
+            !out.batch[0].is_prefill(),
+            "should be in decoding after 3 chunks complete"
+        );
     }
 }
