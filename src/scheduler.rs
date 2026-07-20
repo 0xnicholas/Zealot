@@ -337,6 +337,8 @@ impl Scheduler {
                                 bm.try_free(&h).expect("owned handle");
                             }
                             victim.prefill_pending = true;
+                            victim.prefill_pos = 0;
+                            victim.chunk_size = 0;
                             victim.status = SeqStatus::Waiting;
                             preempted.push(victim.request_id.clone());
                             let key = (Reverse(victim.priority), victim.arrival);
@@ -392,6 +394,26 @@ impl Scheduler {
             let mut seq = self.prefilling.remove(idx);
             seq.prefill_pending = false;
             self.decoding.push(seq);
+        }
+    }
+
+    /// Engine 在 prefill chunk 完成后调用。
+    /// 递增 prefill_pos；最终 chunk 时 promote 到 decoding。
+    pub fn advance_prefill(&mut self, request_id: &str) {
+        let idx = self.prefilling.iter().position(|s| s.request_id == request_id);
+        let is_done = if let Some(idx) = idx {
+            let seq = &mut self.prefilling[idx];
+            seq.prefill_pos += seq.chunk_size;
+            seq.chunk_size = 0;
+            seq.prefill_pos >= seq.prompt_tokens.len()
+        } else {
+            false
+        };
+        if let Some(idx) = idx {
+            self.prefilling[idx].chunk_size = 0;
+        }
+        if is_done {
+            self.promote_to_decoding(request_id);
         }
     }
 
