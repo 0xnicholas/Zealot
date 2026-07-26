@@ -91,8 +91,14 @@ impl CpuModelRunner {
 
         let eos_token_id: Option<i64> = tokenizer_py
             .as_ref()
-            .and_then(|t| Python::with_gil(|py| t.bind(py).getattr("eos_token_id").ok()))
-            .and_then(|v| v.extract().ok());
+            .and_then(|t| {
+                Python::with_gil(|py| {
+                    t.bind(py)
+                        .getattr("eos_token_id")
+                        .and_then(|v| v.extract())
+                        .ok()
+                })
+            });
 
         Ok(Self {
             attn: Box::new(CpuAttention),
@@ -114,11 +120,13 @@ impl CpuModelRunner {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn load_cuda(model_id: &str, device_id: usize) -> Result<Self, ZealotError> {
-        use crate::attention::cuda::CudaAttention;
-        let mut s = Self::load(model_id)?;
-        s.attn = Box::new(CudaAttention::new(device_id)?);
-        Ok(s)
+    pub fn load_cuda(model_id: &str, _device_id: usize) -> Result<Self, ZealotError> {
+        // CudaAttention is now GPU-native (does not impl AttentionBackend).
+        // The full GPU model runner will be wired up in a later milestone.
+        let _ = model_id;
+        Err(ZealotError::Internal(
+            "CudaModelRunner not yet wired — use CpuModelRunner or PyModelRunner".into(),
+        ))
     }
 }
 
