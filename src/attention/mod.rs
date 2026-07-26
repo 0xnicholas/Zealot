@@ -1,5 +1,8 @@
 use crate::error::ZealotError;
 
+#[cfg(feature = "cuda")]
+pub mod cublas;
+
 pub trait AttentionBackend: Send {
     fn forward(
         &self,
