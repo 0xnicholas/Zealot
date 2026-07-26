@@ -20,6 +20,11 @@ pub struct GpuContext {
     pub d2h_stream: CudaStream,
 }
 
+// Safety: CUDA streams are thread-safe when used with proper synchronization.
+// The engine owns a single GpuContext and drives it from a single thread.
+#[cfg(feature = "cuda")]
+unsafe impl Send for GpuContext {}
+
 #[cfg(feature = "cuda")]
 impl GpuContext {
     pub fn new(device_id: usize) -> Result<Self, ZealotError> {

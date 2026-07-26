@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DeviceSlice};
 
 use crate::error::ZealotError;
 use crate::gpu_context::GpuContext;

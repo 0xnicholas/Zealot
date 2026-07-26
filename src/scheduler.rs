@@ -67,7 +67,9 @@ pub struct Sequence {
     pub sampling_params: SamplingParams,
     /// true = 下一步需要 prefill（初始，或被抢占后需 recompute）
     prefill_pending: bool,
-    prefill_pos: usize,
+    /// Current prefill position (in tokens).  Read by runners during
+    /// chunked-prefill KV cache store.
+    pub prefill_pos: usize,
     chunk_size: usize,
 }
 

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr};
 
 use crate::block_manager::BlockManager;
 use crate::error::ZealotError;
@@ -63,8 +63,6 @@ pub struct KVCache {
 
 impl KVCache {
     /// Allocate flat K/V pools for every layer.
-    ///
-    /// `ctx` provides the CUDA device and the compute stream.
     pub fn new(
         num_blocks: usize,
         block_size: usize,
@@ -102,8 +100,6 @@ impl KVCache {
     // ── Sequence lifecycle ──────────────────────────────────────────────
 
     /// Register a new sequence, allocating its GPU block table.
-    ///
-    /// The block table is initialised with -1 sentinels (no blocks allocated).
     pub fn register_seq(&mut self, id: &str, max_blocks: usize) -> Result<(), ZealotError> {
         let table: Vec<i32> = vec![-1; max_blocks];
         let block_table = self
@@ -123,43 +119,47 @@ impl KVCache {
         Ok(())
     }
 
-    /// Allocate a new physical block for `id` via the [`BlockManager`],
-    /// write its ID into the GPU block table, and track it CPU-side.
+    /// Allocate a new physical block for `id` via the [`BlockManager`].
     pub fn alloc_block(
         &mut self,
         id: &str,
         bm: &BlockManager,
     ) -> Result<usize, ZealotError> {
-        let state = self.seq_state_mut(id)?;
         let blk = bm.try_allocate()?;
         let block_id = blk.block_id;
-
-        // Write block ID to GPU block_table at the next free slot
-        let idx = state.block_ids.len();
         let val: Vec<i32> = vec![block_id as i32];
-        self.device
-            .htod_sync_copy(&val)
-            .and_then(|tmp| {
-                let mut dst = state
-                    .block_table
-                    .try_slice_mut(idx..idx + 1)
-                    .ok_or_else(|| {
-                        cudarc::driver::result::DriverError::Other(
-                            "block_table slice oob".into(),
-                        )
-                    })?;
-                self.device.dtod_copy(&tmp, &mut dst)
-            })
-            .map_err(|e| ZealotError::Internal(format!("KVCache alloc_block copy: {e}")))?;
 
-        state.block_ids.push(block_id);
+        // Scope 1: get idx from state
+        let idx = {
+            let state = self.seq_state(id)?;
+            state.block_ids.len()
+        };
+
+        // Scope 2: upload block id to GPU
+        let tmp = self
+            .device
+            .htod_sync_copy(&val)
+            .map_err(|e| ZealotError::Internal(format!("KVCache alloc_block: {e}")))?;
+        {
+            let state = self.seq_state_mut(id)?;
+            let mut dst = state.block_table.try_slice_mut(idx..idx + 1).ok_or_else(|| {
+                ZealotError::Internal("block_table slice oob".into())
+            })?;
+            self.device
+                .dtod_copy(&tmp, &mut dst)
+                .map_err(|e| ZealotError::Internal(format!("KVCache alloc_block copy: {e}")))?;
+        }
+
+        // Scope 3: update CPU-side tracking
+        {
+            let state = self.seq_state_mut(id)?;
+            state.block_ids.push(block_id);
+        }
+
         Ok(block_id)
     }
 
     /// Release a sequence (drop its GPU block_table and metadata).
-    ///
-    /// Does NOT call `bm.try_free()` — the caller is responsible for returning
-    /// physical blocks to the pool.
     pub fn release_seq(&mut self, id: &str) {
         self.seqs.remove(id);
     }
@@ -189,17 +189,17 @@ impl KVCache {
     /// GPU pointer to the block table for `id`.
     pub fn block_table_ptr(&self, id: &str) -> Result<*const i32, ZealotError> {
         let state = self.seq_state(id)?;
-        Ok(**state.block_table as *const i32)
+        Ok(*state.block_table.device_ptr() as *const i32)
     }
 
     /// GPU pointer to the K pool for `layer`.
     pub fn k_pool_ptr(&self, layer: usize) -> *const f32 {
-        **self.k_pools[layer] as *const f32
+        *self.k_pools[layer].device_ptr() as *const f32
     }
 
     /// GPU pointer to the V pool for `layer`.
     pub fn v_pool_ptr(&self, layer: usize) -> *const f32 {
-        **self.v_pools[layer] as *const f32
+        *self.v_pools[layer].device_ptr() as *const f32
     }
 
     // ── Store / append K/V ──────────────────────────────────────────────
@@ -209,7 +209,7 @@ impl KVCache {
     /// On entry `k` and `v` are GPU slices of shape `[n_tokens, num_kv_heads, head_dim]`
     /// (flat, row-major: token → kv_head → dim).
     pub fn store_kv(
-        &self,
+        &mut self,
         layer: usize,
         id: &str,
         k: &CudaSlice<f32>,
@@ -217,38 +217,44 @@ impl KVCache {
         start_token: usize,
         n_tokens: usize,
     ) -> Result<(), ZealotError> {
-        let state = self.seq_state(id)?;
-        let kv_data = self.num_kv_heads * self.head_dim;
-        let kv_block_stride = self.block_size * kv_data;
+        // Extract needed values before any mutable borrows of pools.
+        let num_kv_heads = self.num_kv_heads;
+        let head_dim = self.head_dim;
+        let block_size = self.block_size;
+        let kv_data = num_kv_heads * head_dim;
+        let kv_block_stride = block_size * kv_data;
+        let block_ids = {
+            self.seq_state(id)?.block_ids.clone()
+        };
 
         for t in 0..n_tokens {
             let global_token = start_token + t;
-            let block_idx = global_token / self.block_size;
-            let token_in_block = global_token % self.block_size;
+            let block_idx = global_token / block_size;
+            let token_in_block = global_token % block_size;
 
-            if block_idx >= state.block_ids.len() {
+            if block_idx >= block_ids.len() {
                 return Err(ZealotError::Internal(format!(
                     "KVCache store_kv: block_idx {block_idx} OOB (have {} blocks)",
-                    state.block_ids.len()
+                    block_ids.len()
                 )));
             }
 
-            let block_id = state.block_ids[block_idx];
+            let block_id = block_ids[block_idx];
             let src_base = t * kv_data;
 
-            for h in 0..self.num_kv_heads {
+            for h in 0..num_kv_heads {
                 let pool_off = block_id * kv_block_stride
-                    + h * self.block_size * self.head_dim
-                    + token_in_block * self.head_dim;
-                let src_off = src_base + h * self.head_dim;
+                    + h * block_size * head_dim
+                    + token_in_block * head_dim;
+                let src_off = src_base + h * head_dim;
 
                 let src_view = k
-                    .try_slice(src_off..src_off + self.head_dim)
+                    .try_slice(src_off..src_off + head_dim)
                     .ok_or_else(|| {
                         ZealotError::Internal("KVCache store_kv: k slice OOB".into())
                     })?;
                 let mut dst_view = self.k_pools[layer]
-                    .try_slice_mut(pool_off..pool_off + self.head_dim)
+                    .try_slice_mut(pool_off..pool_off + head_dim)
                     .ok_or_else(|| {
                         ZealotError::Internal("KVCache store_kv: k_pool slice OOB".into())
                     })?;
@@ -259,12 +265,12 @@ impl KVCache {
                     })?;
 
                 let src_view = v
-                    .try_slice(src_off..src_off + self.head_dim)
+                    .try_slice(src_off..src_off + head_dim)
                     .ok_or_else(|| {
                         ZealotError::Internal("KVCache store_kv: v slice OOB".into())
                     })?;
                 let mut dst_view = self.v_pools[layer]
-                    .try_slice_mut(pool_off..pool_off + self.head_dim)
+                    .try_slice_mut(pool_off..pool_off + head_dim)
                     .ok_or_else(|| {
                         ZealotError::Internal("KVCache store_kv: v_pool slice OOB".into())
                     })?;
@@ -288,33 +294,45 @@ impl KVCache {
         k: &CudaSlice<f32>,
         v: &CudaSlice<f32>,
     ) -> Result<(), ZealotError> {
-        let state = self.seq_state_mut(id)?;
-        let kv_data = self.num_kv_heads * self.head_dim;
-        let kv_block_stride = self.block_size * kv_data;
-        let token = state.cached_tokens;
-        let block_idx = token / self.block_size;
-        let token_in_block = state.block_offset;
+        // Collect scalar values and block_ids before mutating pools.
+        let num_kv_heads = self.num_kv_heads;
+        let head_dim = self.head_dim;
+        let block_size = self.block_size;
+        let kv_data = num_kv_heads * head_dim;
+        let kv_block_stride = block_size * kv_data;
 
-        if block_idx >= state.block_ids.len() {
+        // Extract seq state data, releasing the mutable borrow.
+        let (block_ids, token, block_offset) = {
+            let state = self.seq_state_mut(id)?;
+            let ids = state.block_ids.clone();
+            let tok = state.cached_tokens;
+            let off = state.block_offset;
+            (ids, tok, off)
+        };
+
+        let block_idx = token / block_size;
+        let token_in_block = block_offset;
+
+        if block_idx >= block_ids.len() {
             return Err(ZealotError::Internal(format!(
                 "KVCache append_kv: block_idx {block_idx} OOB (have {} blocks)",
-                state.block_ids.len()
+                block_ids.len()
             )));
         }
 
-        let block_id = state.block_ids[block_idx];
+        let block_id = block_ids[block_idx];
 
-        for h in 0..self.num_kv_heads {
+        for h in 0..num_kv_heads {
             let pool_off = block_id * kv_block_stride
-                + h * self.block_size * self.head_dim
-                + token_in_block * self.head_dim;
-            let src_off = h * self.head_dim;
+                + h * block_size * head_dim
+                + token_in_block * head_dim;
+            let src_off = h * head_dim;
 
             let src_view = k
-                .try_slice(src_off..src_off + self.head_dim)
+                .try_slice(src_off..src_off + head_dim)
                 .ok_or_else(|| ZealotError::Internal("KVCache append_kv: k slice OOB".into()))?;
             let mut dst_view = self.k_pools[layer]
-                .try_slice_mut(pool_off..pool_off + self.head_dim)
+                .try_slice_mut(pool_off..pool_off + head_dim)
                 .ok_or_else(|| {
                     ZealotError::Internal("KVCache append_kv: k_pool slice OOB".into())
                 })?;
@@ -325,10 +343,10 @@ impl KVCache {
                 })?;
 
             let src_view = v
-                .try_slice(src_off..src_off + self.head_dim)
+                .try_slice(src_off..src_off + head_dim)
                 .ok_or_else(|| ZealotError::Internal("KVCache append_kv: v slice OOB".into()))?;
             let mut dst_view = self.v_pools[layer]
-                .try_slice_mut(pool_off..pool_off + self.head_dim)
+                .try_slice_mut(pool_off..pool_off + head_dim)
                 .ok_or_else(|| {
                     ZealotError::Internal("KVCache append_kv: v_pool slice OOB".into())
                 })?;
@@ -339,10 +357,14 @@ impl KVCache {
                 })?;
         }
 
-        state.cached_tokens += 1;
-        state.block_offset += 1;
-        if state.block_offset >= self.block_size {
-            state.block_offset = 0;
+        // Update sequence state.
+        {
+            let state = self.seq_state_mut(id)?;
+            state.cached_tokens += 1;
+            state.block_offset += 1;
+            if state.block_offset >= block_size {
+                state.block_offset = 0;
+            }
         }
         Ok(())
     }

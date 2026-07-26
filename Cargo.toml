@@ -39,5 +39,5 @@ opt-level = 3
 codegen-units = 1
 
 [features]
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "cudarc/cuda-12080"]
 default = []

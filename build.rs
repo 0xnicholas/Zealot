@@ -37,7 +37,12 @@ fn compile_cuda_kernels() {
     let nvcc = match which::which("nvcc") {
         Ok(path) => path,
         Err(_) => {
-            println!("cargo:warning=nvcc not found — CUDA kernels will not be compiled");
+            println!("cargo:warning=nvcc not found — generating PTX stubs (no GPU compute)");
+            for cu_file in &cu_files {
+                let ptx_name = format!("{}.ptx", cu_file.trim_end_matches(".cu"));
+                let ptx_path = out_dir.join(&ptx_name);
+                std::fs::write(&ptx_path, "\"\"").unwrap();
+            }
             return;
         }
     };
