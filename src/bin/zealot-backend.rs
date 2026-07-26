@@ -19,7 +19,7 @@ use tokio_stream::{wrappers::ReceiverStream, wrappers::TcpListenerStream, Stream
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
 use zealot_engine::engine::{Engine, ModelRunner};
-use zealot_engine::model_runner_cuda::CudaModelRunner;
+use zealot_engine::model_runner_cpu::CpuModelRunner;
 use zealot_engine::model_runner_py::PyModelRunner;
 use zealot_engine::sampling::SamplingParams;
 use zealot_engine::scheduler::{Priority, Scheduler, SchedulerConfig};
@@ -287,12 +287,12 @@ impl InferenceRuntime for ZealotBackend {
             } else {
                 #[cfg(feature = "cuda")]
                 {
-                    CudaModelRunner::load_cuda(&model_id, 0)
+                    CpuModelRunner::load_cuda(&model_id, 0)
                         .map(|r| Box::new(r) as Box<dyn ModelRunner>)
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    CudaModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>)
+                    CpuModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>)
                 }
             }
         })

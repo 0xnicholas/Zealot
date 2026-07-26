@@ -6,11 +6,8 @@ use pyo3::types::{PyDict, PyList};
 use crate::attention::{AttentionBackend, AttentionBatch, CpuAttention};
 use crate::engine::{ModelRunner, StepOut};
 use crate::error::ZealotError;
+use crate::model_loader;
 use crate::scheduler::Sequence;
-
-fn py_err(ctx: &str) -> impl Fn(PyErr) -> ZealotError + '_ {
-    move |e: PyErr| ZealotError::Internal(format!("{ctx}: {e}"))
-}
 
 #[allow(dead_code)]
 struct KvCache {
@@ -22,7 +19,7 @@ struct KvCache {
 }
 
 #[allow(dead_code)]
-pub struct CudaModelRunner {
+pub struct CpuModelRunner {
     attn: Box<dyn AttentionBackend>,
     #[allow(dead_code)]
     states: HashMap<String, KvCache>,
@@ -41,7 +38,7 @@ pub struct CudaModelRunner {
     eos_token_id: Option<i64>,
 }
 
-impl CudaModelRunner {
+impl CpuModelRunner {
     pub fn new_cpu() -> Self {
         Self {
             attn: Box::new(CpuAttention),
@@ -63,118 +60,56 @@ impl CudaModelRunner {
     }
 
     pub fn load(model_id: &str) -> Result<Self, ZealotError> {
-        Python::with_gil(|py| -> Result<Self, ZealotError> {
+        let weights = model_loader::load_weights(model_id)?;
+        let tokenizer_py = Python::with_gil(|py| -> Result<Option<Py<PyAny>>, ZealotError> {
             if let Ok(sp) = std::env::var("ZEALOT_SITE_PACKAGES") {
-                let sys = py.import("sys").map_err(py_err("import sys"))?;
+                let sys = py
+                    .import("sys")
+                    .map_err(model_loader::py_err("import sys"))?;
                 sys.getattr("path")
-                    .map_err(py_err("sys.path"))?
+                    .map_err(model_loader::py_err("sys.path"))?
                     .call_method1("insert", (0, sp))
-                    .map_err(py_err("sys.path.insert"))?;
+                    .map_err(model_loader::py_err("sys.path.insert"))?;
             }
 
             let _torch = py
                 .import("torch")
-                .map_err(py_err("import torch (venv? set ZEALOT_SITE_PACKAGES)"))?;
+                .map_err(model_loader::py_err(
+                    "import torch (venv? set ZEALOT_SITE_PACKAGES)",
+                ))?;
             let transformers = py
                 .import("transformers")
-                .map_err(py_err("import transformers"))?;
+                .map_err(model_loader::py_err("import transformers"))?;
 
             let tokenizer = transformers
                 .getattr("AutoTokenizer")
-                .map_err(py_err("AutoTokenizer"))?
+                .map_err(model_loader::py_err("AutoTokenizer"))?
                 .call_method1("from_pretrained", (model_id,))
-                .map_err(py_err("tokenizer from_pretrained"))?;
-            let model = transformers
-                .getattr("AutoModelForCausalLM")
-                .map_err(py_err("AutoModelForCausalLM"))?
-                .call_method1("from_pretrained", (model_id,))
-                .map_err(py_err("model from_pretrained"))?;
+                .map_err(model_loader::py_err("tokenizer from_pretrained"))?;
+            Ok(Some(tokenizer.unbind()))
+        })?;
 
-            let eos_token_id: Option<i64> = tokenizer
-                .getattr("eos_token_id")
-                .and_then(|v| v.extract())
-                .ok();
+        let eos_token_id: Option<i64> = tokenizer_py
+            .as_ref()
+            .and_then(|t| Python::with_gil(|py| t.bind(py).getattr("eos_token_id").ok()))
+            .and_then(|v| v.extract().ok());
 
-            let config = model.getattr("config").map_err(py_err("model.config"))?;
-            let hidden_dim: usize = config
-                .getattr("hidden_size")
-                .map_err(py_err("hidden_size"))?
-                .extract()
-                .map_err(py_err("hidden_size"))?;
-            let num_heads: usize = config
-                .getattr("num_attention_heads")
-                .map_err(py_err("num_attention_heads"))?
-                .extract()
-                .map_err(py_err("num_attention_heads"))?;
-            let head_dim: usize = hidden_dim / num_heads;
-            let num_layers: usize = config
-                .getattr("num_hidden_layers")
-                .map_err(py_err("num_hidden_layers"))?
-                .extract()
-                .map_err(py_err("num_hidden_layers"))?;
-
-            let wte = model
-                .getattr("transformer")
-                .and_then(|t| t.getattr("wte"))
-                .or_else(|_| {
-                    model
-                        .getattr("model")
-                        .and_then(|m| m.getattr("embed_tokens"))
-                })
-                .map_err(py_err("embed_tokens"))?
-                .getattr("weight")
-                .map_err(py_err("weight"))?;
-            let wte_data: Vec<f32> = to_vec_f32(&wte)?;
-            let vocab_size = wte_data.len() / hidden_dim;
-
-            let extract_layer = |suffix: &str| -> Result<Vec<f32>, ZealotError> {
-                let layer = model
-                    .getattr("transformer")
-                    .and_then(|t| t.getattr("h"))
-                    .or_else(|_| model.getattr("model").and_then(|m| m.getattr("layers")))
-                    .map_err(py_err("layers"))?;
-                let l0 = layer.get_item(0).map_err(py_err("layer[0]"))?;
-                let attn = l0
-                    .getattr("attn")
-                    .or_else(|_| l0.getattr("self_attn").or_else(|_| l0.getattr("attention")))
-                    .map_err(py_err("attn"))?;
-                let w = attn
-                    .getattr(suffix)
-                    .map_err(py_err("qkv suffix"))?
-                    .getattr("weight")
-                    .map_err(py_err("weight"))?;
-                to_vec_f32(&w)
-            };
-
-            let q_proj = extract_layer("q_proj")?;
-            let k_proj = extract_layer("k_proj")?;
-            let v_proj = extract_layer("v_proj")?;
-            let attn_proj = extract_layer("o_proj")?;
-
-            let lm_head_data = model
-                .getattr("lm_head")
-                .ok()
-                .and_then(|h| h.getattr("weight").ok())
-                .and_then(|w| to_vec_f32(&w).ok())
-                .unwrap_or_else(|| wte_data.clone());
-
-            Ok(Self {
-                attn: Box::new(CpuAttention),
-                states: HashMap::new(),
-                tokenizer_py: Some(tokenizer.unbind()),
-                embedding: wte_data,
-                q_proj,
-                k_proj,
-                v_proj,
-                attn_proj,
-                lm_head: lm_head_data,
-                hidden_dim,
-                num_heads,
-                head_dim,
-                num_layers,
-                vocab_size,
-                eos_token_id,
-            })
+        Ok(Self {
+            attn: Box::new(CpuAttention),
+            states: HashMap::new(),
+            tokenizer_py,
+            embedding: weights.embedding,
+            q_proj: weights.q_proj,
+            k_proj: weights.k_proj,
+            v_proj: weights.v_proj,
+            attn_proj: weights.attn_proj,
+            lm_head: weights.lm_head,
+            hidden_dim: weights.hidden_dim,
+            num_heads: weights.num_heads,
+            head_dim: weights.head_dim,
+            num_layers: weights.num_layers,
+            vocab_size: weights.vocab_size,
+            eos_token_id,
         })
     }
 
@@ -187,22 +122,7 @@ impl CudaModelRunner {
     }
 }
 
-fn to_vec_f32(tensor: &Bound<'_, PyAny>) -> Result<Vec<f32>, ZealotError> {
-    let cpu = tensor
-        .call_method0("cpu")
-        .or_else(|_| -> Result<Bound<'_, PyAny>, PyErr> { Ok(tensor.to_owned()) })
-        .map_err(|e| ZealotError::Internal(format!("cpu: {e}")))?;
-    let flat = cpu
-        .call_method1("reshape", (-1,))
-        .map_err(|e| ZealotError::Internal(format!("reshape: {e}")))?;
-    let list = flat
-        .call_method0("tolist")
-        .map_err(|e| ZealotError::Internal(format!("tolist: {e}")))?;
-    list.extract::<Vec<f32>>()
-        .map_err(|e| ZealotError::Internal(format!("extract: {e}")))
-}
-
-impl ModelRunner for CudaModelRunner {
+impl ModelRunner for CpuModelRunner {
     fn tokenize_chat(&self, messages: &[(String, String)]) -> Result<Vec<i64>, ZealotError> {
         Python::with_gil(|py| -> Result<Vec<i64>, ZealotError> {
             let tokenizer = self
@@ -213,20 +133,24 @@ impl ModelRunner for CudaModelRunner {
             let list = PyList::empty(py);
             for (role, content) in messages {
                 let d = PyDict::new(py);
-                d.set_item("role", role).map_err(py_err("msg role"))?;
+                d.set_item("role", role)
+                    .map_err(model_loader::py_err("msg role"))?;
                 d.set_item("content", content)
-                    .map_err(py_err("msg content"))?;
-                list.append(d).map_err(py_err("msg append"))?;
+                    .map_err(model_loader::py_err("msg content"))?;
+                list.append(d)
+                    .map_err(model_loader::py_err("msg append"))?;
             }
             let kwargs = PyDict::new(py);
-            kwargs.set_item("tokenize", true).map_err(py_err("kw"))?;
+            kwargs
+                .set_item("tokenize", true)
+                .map_err(model_loader::py_err("kw"))?;
             kwargs
                 .set_item("add_generation_prompt", true)
-                .map_err(py_err("kw"))?;
+                .map_err(model_loader::py_err("kw"))?;
             match tokenizer.call_method("apply_chat_template", (list,), Some(&kwargs)) {
                 Ok(ids) => ids
                     .extract::<Vec<i64>>()
-                    .map_err(py_err("chat_template ids")),
+                    .map_err(model_loader::py_err("chat_template ids")),
                 Err(_) => {
                     let text = messages
                         .iter()
@@ -236,9 +160,9 @@ impl ModelRunner for CudaModelRunner {
                         + "\n";
                     tokenizer
                         .call_method1("encode", (text,))
-                        .map_err(py_err("encode"))?
+                        .map_err(model_loader::py_err("encode"))?
                         .extract::<Vec<i64>>()
-                        .map_err(py_err("encode ids"))
+                        .map_err(model_loader::py_err("encode ids"))
                 }
             }
         })
@@ -361,7 +285,7 @@ mod tests {
 
     #[test]
     fn new_cpu_has_cpu_attention() {
-        let runner = CudaModelRunner::new_cpu();
+        let runner = CpuModelRunner::new_cpu();
         assert_eq!(runner.states.len(), 0);
         assert_eq!(runner.hidden_dim, 0);
     }
