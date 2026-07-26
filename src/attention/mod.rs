@@ -2,7 +2,7 @@ use crate::error::ZealotError;
 
 pub trait AttentionBackend: Send {
     fn forward(
-        &mut self,
+        &self,
         query: &[f32],
         key: &[f32],
         value: &[f32],
@@ -21,7 +21,7 @@ pub struct CpuAttention;
 
 impl AttentionBackend for CpuAttention {
     fn forward(
-        &mut self,
+        &self,
         query: &[f32],
         key: &[f32],
         value: &[f32],
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn cpu_attention_single_seq_output_shape() {
-        let mut attn = CpuAttention;
+        let attn = CpuAttention;
         let batch = AttentionBatch {
             num_seqs: 1,
             num_heads: 2,
@@ -127,7 +127,7 @@ mod tests {
 
     #[test]
     fn cpu_attention_returns_error_on_dimension_mismatch() {
-        let mut attn = CpuAttention;
+        let attn = CpuAttention;
         let batch = AttentionBatch {
             num_seqs: 1,
             num_heads: 2,
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn cpu_attention_multi_seq_separate_attention() {
-        let mut attn = CpuAttention;
+        let attn = CpuAttention;
         let batch = AttentionBatch {
             num_seqs: 2,
             num_heads: 1,

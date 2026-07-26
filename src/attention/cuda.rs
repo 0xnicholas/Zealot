@@ -23,7 +23,7 @@ impl CudaAttention {
 #[cfg(feature = "cuda")]
 impl AttentionBackend for CudaAttention {
     fn forward(
-        &mut self,
+        &self,
         q: &[f32],
         k: &[f32],
         v: &[f32],
