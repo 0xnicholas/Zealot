@@ -8,6 +8,7 @@
 // Sentinel: block_table entry < 0 signals end-of-sequence.
 
 #define WARP 32
+#define MAX_HEADS_PER_KV 8
 
 extern "C" __global__ void paged_attention_kernel(
     const float* Q,            // [num_seqs, num_heads, head_dim]
@@ -135,6 +136,156 @@ extern "C" __global__ void paged_attention_kernel(
         int o_base = seq * num_heads * head_dim + head * head_dim;
         for (int d = 0; d < head_dim; d++) {
             O[o_base + d] = O_smem[d] * inv_l;
+        }
+    }
+}
+
+/// PagedAttention with Grouped-Query Attention (GQA).
+///
+/// Grid: (num_seqs, num_kv_heads).  Each block handles `heads_per_kv`
+/// query heads that share one KV head.  K/V are loaded ONCE into shared
+/// memory; each Q head computes attention independently via online softmax.
+///
+/// Falls back gracefully: when num_heads == num_kv_heads (MHA), the
+/// existing `paged_attention_kernel` is preferred (fewer registers).
+extern "C" __global__ void paged_attention_gqa_kernel(
+    const float* Q,            // [num_seqs, num_heads, head_dim]
+    const float* K_pool,       // flat K cache: [num_blocks * block_size * num_kv_heads * head_dim]
+    const float* V_pool,       // flat V cache (same layout as K_pool)
+    float* O,                  // [num_seqs, num_heads, head_dim]
+    const int* block_table,    // [num_seqs, max_blocks_per_seq] — sentinel < 0
+    const int* seq_lens,       // [num_seqs]
+    int num_seqs,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_blocks_per_seq,
+    int block_size,
+    float scale
+) {
+    int seq = blockIdx.x;
+    int kv_head = blockIdx.y;
+    if (seq >= num_seqs || kv_head >= num_kv_heads) return;
+
+    int heads_per_kv = num_heads / num_kv_heads;
+    int seq_len = seq_lens[seq];
+    int num_tiles = (seq_len + block_size - 1) / block_size;
+
+    // ── Shared memory ─────────────────────────────────────────────────
+    extern __shared__ float smem[];
+    float* K_smem = smem;
+    float* V_smem = K_smem + block_size * head_dim;
+
+    // ── Q for all heads in group (thread 0 loads into registers) ──────
+    float Q_reg[MAX_HEADS_PER_KV][128];
+    float m[MAX_HEADS_PER_KV];
+    float l[MAX_HEADS_PER_KV];
+
+    if (threadIdx.x == 0) {
+        for (int hh = 0; hh < heads_per_kv; hh++) {
+            int head = kv_head * heads_per_kv + hh;
+            int q_base = seq * num_heads * head_dim + head * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                Q_reg[hh][d] = Q[q_base + d];
+            }
+            // ── Online softmax accumulators ──────────────────────
+            m[hh] = -1e30f;
+            l[hh] = 0.0f;
+        }
+    }
+
+    // ── O accumulators in shared memory ───────────────────────────────
+    float* O_smem = V_smem + block_size * head_dim;  // heads_per_kv * head_dim
+    if (threadIdx.x == 0) {
+        for (int hh = 0; hh < heads_per_kv; hh++) {
+            for (int d = 0; d < head_dim; d++) {
+                O_smem[hh * head_dim + d] = 0.0f;
+            }
+        }
+    }
+    __syncthreads();
+
+    int kv_block_stride = block_size * num_kv_heads * head_dim;
+
+    for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
+        int block_id = block_table[seq * max_blocks_per_seq + tile_idx];
+        if (block_id < 0) break;
+
+        int n_tokens = block_size;
+        if (tile_idx == num_tiles - 1) {
+            int remaining = seq_len - tile_idx * block_size;
+            if (remaining < block_size) n_tokens = remaining;
+        }
+
+        // ── Load K and V tile into shared memory (once per tile) ──
+        int block_base = block_id * kv_block_stride + kv_head * block_size * head_dim;
+        for (int i = threadIdx.x; i < n_tokens * head_dim; i += blockDim.x) {
+            int token = i / head_dim;
+            int dim = i % head_dim;
+            int off = block_base + token * head_dim + dim;
+            K_smem[token * head_dim + dim] = K_pool[off];
+            V_smem[token * head_dim + dim] = V_pool[off];
+        }
+        __syncthreads();
+
+        // ── Thread 0: compute attention for each Q head ───────────
+        if (threadIdx.x == 0) {
+            for (int hh = 0; hh < heads_per_kv; hh++) {
+                // Compute S = Q @ K^T → n_tokens scores
+                float S[16];
+                for (int t = 0; t < n_tokens; t++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        dot += Q_reg[hh][d] * K_smem[t * head_dim + d];
+                    }
+                    S[t] = dot * scale;
+                }
+
+                // Find max
+                float m_new = m[hh];
+                for (int t = 0; t < n_tokens; t++) {
+                    if (S[t] > m_new) m_new = S[t];
+                }
+
+                // Exp + softmax denominator update
+                float l_new = 0.0f;
+                float P[16];
+                for (int t = 0; t < n_tokens; t++) {
+                    float p = expf(S[t] - m_new);
+                    P[t] = p;
+                    l_new += p;
+                }
+
+                // Rescale O accumulator
+                float alpha = expf(m[hh] - m_new);
+                for (int d = 0; d < head_dim; d++) {
+                    O_smem[hh * head_dim + d] *= alpha;
+                }
+
+                // Accumulate P @ V
+                for (int t = 0; t < n_tokens; t++) {
+                    float p = P[t];
+                    for (int d = 0; d < head_dim; d++) {
+                        O_smem[hh * head_dim + d] += p * V_smem[t * head_dim + d];
+                    }
+                }
+
+                l[hh] = l[hh] * alpha + l_new;
+                m[hh] = m_new;
+            }
+        }
+        __syncthreads();
+    }
+
+    // ── Normalize and write O for all heads in group ──────────────────
+    if (threadIdx.x == 0) {
+        for (int hh = 0; hh < heads_per_kv; hh++) {
+            int head = kv_head * heads_per_kv + hh;
+            float inv_l = 1.0f / l[hh];
+            int o_base = seq * num_heads * head_dim + head * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                O[o_base + d] = O_smem[hh * head_dim + d] * inv_l;
+            }
         }
     }
 }

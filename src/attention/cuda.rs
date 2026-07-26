@@ -20,16 +20,22 @@ use crate::error::ZealotError;
 pub struct CudaAttention {
     kernel: CudaFunction,
     paged_kernel: CudaFunction,
+    gqa_kernel: CudaFunction,
     #[allow(dead_code)]
     dev: Arc<CudaDevice>,
 }
 
 #[cfg(feature = "cuda")]
 impl CudaAttention {
-    /// Create a `CudaAttention` that will launch `kernel` (tiled attention)
-    /// and `paged_kernel` (PagedAttention) on `device`.
-    pub fn new(kernel: CudaFunction, paged_kernel: CudaFunction, device: Arc<CudaDevice>) -> Self {
-        Self { kernel, paged_kernel, dev: device }
+    /// Create a `CudaAttention` that will launch `kernel` (tiled attention),
+    /// `paged_kernel` (PagedAttention), and `gqa_kernel` (GQA PagedAttention) on `device`.
+    pub fn new(
+        kernel: CudaFunction,
+        paged_kernel: CudaFunction,
+        gqa_kernel: CudaFunction,
+        device: Arc<CudaDevice>,
+    ) -> Self {
+        Self { kernel, paged_kernel, gqa_kernel, dev: device }
     }
 
     /// Launch the flash-attention kernel on the device's default stream.
@@ -129,20 +135,38 @@ impl CudaAttention {
         max_blocks_per_seq: usize,
     ) -> Result<(), ZealotError> {
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let shared_mem =
-            (block_size * head_dim * 2 * std::mem::size_of::<f32>()) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (num_seqs as u32, num_heads as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: shared_mem,
-        };
-
         let ns = num_seqs as i32;
         let nh = num_heads as i32;
         let nkh = num_kv_heads as i32;
         let hd = head_dim as i32;
         let bs = block_size as i32;
         let mb = max_blocks_per_seq as i32;
+
+        // ── GQA dispatch: use GQA kernel when num_heads > num_kv_heads ──
+        let heads_per_kv = num_heads / num_kv_heads;
+        let (kernel_to_use, grid_dim, shared_mem) = if num_heads == num_kv_heads {
+            // MHA: existing kernel, grid = (num_seqs, num_heads)
+            let smem = (block_size * head_dim * 2 * std::mem::size_of::<f32>()) as u32;
+            (&self.paged_kernel, (num_seqs as u32, num_heads as u32, 1), smem)
+        } else if heads_per_kv <= 8 {
+            // GQA: shared kernel, grid = (num_seqs, num_kv_heads)
+            // Shared memory: K + V tiles + O accumulators (heads_per_kv * head_dim)
+            let smem = ((block_size * head_dim * 2 + heads_per_kv * head_dim)
+                * std::mem::size_of::<f32>()) as u32;
+            (&self.gqa_kernel, (num_seqs as u32, num_kv_heads as u32, 1), smem)
+        } else {
+            // Fallback: use MHA kernel (duplicated K/V loads per head)
+            let smem = (block_size * head_dim * 2 * std::mem::size_of::<f32>()) as u32;
+            (&self.paged_kernel, (num_seqs as u32, num_heads as u32, 1), smem)
+        };
+
+        let cfg = LaunchConfig {
+            grid_dim,
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared_mem,
+        };
+
+        let kernel_to_use = kernel_to_use.clone();
 
         let mut params: Vec<*mut c_void> = vec![
             std::ptr::addr_of!(q) as *mut c_void,
@@ -161,8 +185,7 @@ impl CudaAttention {
         ];
 
         unsafe {
-            self.paged_kernel
-                .clone()
+            kernel_to_use
                 .launch(cfg, &mut params)
                 .map_err(|e| ZealotError::Internal(format!("paged_attention: {e}")))?;
         }
