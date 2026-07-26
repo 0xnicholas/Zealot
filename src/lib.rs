@@ -3,6 +3,8 @@ use pyo3::prelude::*;
 pub mod attention;
 pub mod block_manager;
 mod constrained_decode;
+#[cfg(feature = "cuda")]
+pub mod cuda_runner;
 pub mod engine;
 pub mod error;
 #[cfg(feature = "cuda")]

@@ -4,6 +4,9 @@ use crate::error::ZealotError;
 pub mod cublas;
 
 #[cfg(feature = "cuda")]
+pub mod cuda;
+
+#[cfg(feature = "cuda")]
 pub mod kernels;
 
 pub trait AttentionBackend: Send {
