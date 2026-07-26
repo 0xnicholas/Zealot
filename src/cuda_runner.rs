@@ -60,10 +60,11 @@ impl CudaModelRunner {
         // 3. PTX kernels (attention, rms_norm, embedding)
         let kernels = KernelModule::load(&ctx.device)?;
 
-        // 4. Attention operator (tiled + paged)
+        // 4. Attention operator (tiled + paged + GQA)
         let attn = CudaAttention::new(
             kernels.attention.clone(),
             kernels.paged_attention.clone(),
+            kernels.paged_attention_gqa.clone(),
             ctx.device.clone(),
         );
 
@@ -296,10 +297,17 @@ impl ModelRunner for CudaModelRunner {
             drop(ids_gpu);
 
             // ── 2. Layer loop ─────────────────────────────────────
+            let inter_dim = self.weights.intermediate_dim;
+
             for layer_idx in 0..self.weights.num_layers {
                 let lw = &self.weights.layers[layer_idx];
 
-                // RMS Norm
+                // ── Attention sub-block ────────────────────────────
+                // hidden is the residual for the attention sub-block.
+                // It stays alive through RMS norm, QKV, attention, output_proj,
+                // then participates in the first add.
+
+                // RMS Norm (attn weight)
                 let mut normed = self.pool.acquire(&self.ctx, seq_len * hid)?;
                 kernels::launch_rms_norm_raw(
                     &self.kernels.rms_norm,
@@ -310,7 +318,6 @@ impl ModelRunner for CudaModelRunner {
                     hid,
                     1e-6,
                 )?;
-                self.pool.release(hidden);
 
                 // QKV projection
                 let mut q = self.pool.acquire(&self.ctx, seq_len * proj_dim)?;
@@ -473,8 +480,8 @@ impl ModelRunner for CudaModelRunner {
                 )?;
                 self.pool.release(attn_hm);
 
-                // Output projection: FULL [seq_len, hid_dim]
-                hidden = self.pool.acquire(&self.ctx, seq_len * hid)?;
+                // Output projection: [seq_len, hid]
+                let mut hidden_proj = self.pool.acquire(&self.ctx, seq_len * hid)?;
                 self.ctx.cublas.sgemm(
                     seq_len as i32,
                     hid as i32,
@@ -485,10 +492,120 @@ impl ModelRunner for CudaModelRunner {
                     dev_ptr(&lw.attn_proj),
                     hid as i32,
                     CublasOp::T,
-                    dev_ptr_mut(&mut hidden),
+                    dev_ptr_mut(&mut hidden_proj),
                     hid as i32,
                 )?;
                 self.pool.release(attn_inter);
+
+                // ── First residual: hidden = hidden_proj + residual ──
+                {
+                    // hidden is the residual (from embedding or previous layer)
+                    let mut hidden_out = self.pool.acquire(&self.ctx, seq_len * hid)?;
+                    kernels::launch_add(
+                        &self.kernels.add,
+                        dev_ptr(&hidden_proj),
+                        dev_ptr(&hidden),
+                        dev_ptr_mut(&mut hidden_out),
+                        seq_len * hid,
+                    )?;
+                    self.pool.release(hidden_proj);
+                    self.pool.release(hidden);
+                    hidden = hidden_out;
+                }
+
+                // ── FFN sub-block: SiLU gate-mul + down ────────────
+                // hidden is the residual for the FFN sub-block.
+
+                // RMS Norm (ffn weight)
+                let mut ffn_normed = self.pool.acquire(&self.ctx, seq_len * hid)?;
+                kernels::launch_rms_norm_raw(
+                    &self.kernels.rms_norm,
+                    dev_ptr(&hidden),
+                    dev_ptr(&lw.rms_ffn_weight),
+                    dev_ptr_mut(&mut ffn_normed),
+                    seq_len,
+                    hid,
+                    1e-6,
+                )?;
+
+                // Gate projection: ffn_normed [seq,hid] @ gate_proj^T [inter,hid] → gate [seq,inter]
+                let mut gate = self.pool.acquire(&self.ctx, seq_len * inter_dim)?;
+                self.ctx.cublas.sgemm(
+                    seq_len as i32,
+                    inter_dim as i32,
+                    hid as i32,
+                    dev_ptr(&ffn_normed),
+                    hid as i32,
+                    CublasOp::N,
+                    dev_ptr(&lw.gate_proj),
+                    inter_dim as i32,
+                    CublasOp::T,
+                    dev_ptr_mut(&mut gate),
+                    inter_dim as i32,
+                )?;
+
+                // Up projection: ffn_normed [seq,hid] @ up_proj^T [inter,hid] → up [seq,inter]
+                let mut up = self.pool.acquire(&self.ctx, seq_len * inter_dim)?;
+                self.ctx.cublas.sgemm(
+                    seq_len as i32,
+                    inter_dim as i32,
+                    hid as i32,
+                    dev_ptr(&ffn_normed),
+                    hid as i32,
+                    CublasOp::N,
+                    dev_ptr(&lw.up_proj),
+                    inter_dim as i32,
+                    CublasOp::T,
+                    dev_ptr_mut(&mut up),
+                    inter_dim as i32,
+                )?;
+                self.pool.release(ffn_normed);
+
+                // SiLU gate-mul: gated = silu(gate) * up  [same shape]
+                let mut gated = self.pool.acquire(&self.ctx, seq_len * inter_dim)?;
+                kernels::launch_silu_gate_mul(
+                    &self.kernels.silu_gate_mul,
+                    dev_ptr(&gate),
+                    dev_ptr(&up),
+                    dev_ptr_mut(&mut gated),
+                    seq_len,
+                    inter_dim,
+                )?;
+                self.pool.release(gate);
+                self.pool.release(up);
+
+                // Down projection: gated [seq,inter] @ down_proj^T [hid,inter] → hidden_ffn [seq,hid]
+                let mut hidden_ffn = self.pool.acquire(&self.ctx, seq_len * hid)?;
+                self.ctx.cublas.sgemm(
+                    seq_len as i32,
+                    hid as i32,
+                    inter_dim as i32,
+                    dev_ptr(&gated),
+                    inter_dim as i32,
+                    CublasOp::N,
+                    dev_ptr(&lw.down_proj),
+                    hid as i32,
+                    CublasOp::T,
+                    dev_ptr_mut(&mut hidden_ffn),
+                    hid as i32,
+                )?;
+                self.pool.release(gated);
+
+                // ── Second residual: hidden = hidden_ffn + residual ──
+                {
+                    // hidden is the residual (first residual output)
+                    let mut hidden_out = self.pool.acquire(&self.ctx, seq_len * hid)?;
+                    kernels::launch_add(
+                        &self.kernels.add,
+                        dev_ptr(&hidden_ffn),
+                        dev_ptr(&hidden),
+                        dev_ptr_mut(&mut hidden_out),
+                        seq_len * hid,
+                    )?;
+                    self.pool.release(hidden_ffn);
+                    self.pool.release(hidden);
+                    hidden = hidden_out;
+                }
             }
 
             // ── 3. Final RMS Norm (last token only) ─────────────────
