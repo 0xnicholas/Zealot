@@ -31,6 +31,7 @@ fn compile_cuda_kernels() {
         "embedding.cu",
         "transpose.cu",
         "paged_attention.cu",
+        "activation.cu",
     ];
 
     // Find nvcc

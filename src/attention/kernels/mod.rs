@@ -15,6 +15,8 @@ static EMBEDDING_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/embedding.p
 static TRANSPOSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/transpose.ptx"));
 #[cfg(feature = "cuda")]
 static PAGED_ATTENTION_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/paged_attention.ptx"));
+#[cfg(feature = "cuda")]
+static ACTIVATION_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/activation.ptx"));
 
 #[cfg(feature = "cuda")]
 pub struct KernelModule {
@@ -23,6 +25,9 @@ pub struct KernelModule {
     pub embedding: CudaFunction,
     pub transpose: CudaFunction,
     pub paged_attention: CudaFunction,
+    pub paged_attention_gqa: CudaFunction,
+    pub silu_gate_mul: CudaFunction,
+    pub add: CudaFunction,
 }
 
 #[cfg(feature = "cuda")]
@@ -43,6 +48,9 @@ impl KernelModule {
         let pa_mod = device
             .load_ptx(PAGED_ATTENTION_PTX.into(), "paged_attention_ptx", &[])
             .map_err(|e| ZealotError::Internal(format!("load paged_attention PTX: {e}")))?;
+        let act_mod = device
+            .load_ptx(ACTIVATION_PTX.into(), "activation_ptx", &[])
+            .map_err(|e| ZealotError::Internal(format!("load activation PTX: {e}")))?;
 
         Ok(Self {
             attention: attn_mod
@@ -60,6 +68,15 @@ impl KernelModule {
             paged_attention: pa_mod
                 .get_fn("paged_attention_kernel")
                 .map_err(|e| ZealotError::Internal(format!("get paged_attention fn: {e}")))?,
+            paged_attention_gqa: pa_mod
+                .get_fn("paged_attention_gqa_kernel")
+                .map_err(|e| ZealotError::Internal(format!("get paged_attention_gqa fn: {e}")))?,
+            silu_gate_mul: act_mod
+                .get_fn("silu_gate_mul_kernel")
+                .map_err(|e| ZealotError::Internal(format!("get silu_gate_mul fn: {e}")))?,
+            add: act_mod
+                .get_fn("add_kernel")
+                .map_err(|e| ZealotError::Internal(format!("get add fn: {e}")))?,
         })
     }
 }
@@ -164,5 +181,81 @@ pub fn launch_rms_norm_raw(
             .clone()
             .launch(cfg, &mut params)
             .map_err(|e| ZealotError::Internal(format!("rms_norm kernel: {e}")))
+    }
+}
+
+/// Launch the SiLU gate-mul activation kernel.
+///
+/// # Safety
+/// The caller must ensure all pointers are valid device allocations for the
+/// duration of the launch.
+#[cfg(feature = "cuda")]
+pub fn launch_silu_gate_mul(
+    kernel: &CudaFunction,
+    gate: *const f32,
+    up: *const f32,
+    out: *mut f32,
+    n: usize,
+    inter_dim: usize,
+) -> Result<(), ZealotError> {
+    let total = n * inter_dim;
+    let cfg = LaunchConfig {
+        grid_dim: (((total + 255) / 256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    use std::ffi::c_void;
+    let n_i32 = n as i32;
+    let id_i32 = inter_dim as i32;
+    let mut params: Vec<*mut c_void> = vec![
+        std::ptr::addr_of!(gate) as *mut c_void,
+        std::ptr::addr_of!(up) as *mut c_void,
+        std::ptr::addr_of!(out) as *mut c_void,
+        std::ptr::addr_of!(n_i32) as *mut c_void,
+        std::ptr::addr_of!(id_i32) as *mut c_void,
+    ];
+
+    unsafe {
+        kernel
+            .clone()
+            .launch(cfg, &mut params)
+            .map_err(|e| ZealotError::Internal(format!("silu_gate_mul kernel: {e}")))
+    }
+}
+
+/// Launch the element-wise add kernel.
+///
+/// # Safety
+/// The caller must ensure all pointers are valid device allocations for the
+/// duration of the launch.
+#[cfg(feature = "cuda")]
+pub fn launch_add(
+    kernel: &CudaFunction,
+    a: *const f32,
+    b: *const f32,
+    out: *mut f32,
+    n: usize,
+) -> Result<(), ZealotError> {
+    let cfg = LaunchConfig {
+        grid_dim: (((n + 255) / 256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    use std::ffi::c_void;
+    let n_i32 = n as i32;
+    let mut params: Vec<*mut c_void> = vec![
+        std::ptr::addr_of!(a) as *mut c_void,
+        std::ptr::addr_of!(b) as *mut c_void,
+        std::ptr::addr_of!(out) as *mut c_void,
+        std::ptr::addr_of!(n_i32) as *mut c_void,
+    ];
+
+    unsafe {
+        kernel
+            .clone()
+            .launch(cfg, &mut params)
+            .map_err(|e| ZealotError::Internal(format!("add kernel: {e}")))
     }
 }
