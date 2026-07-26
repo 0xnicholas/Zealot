@@ -2,6 +2,8 @@ use pyo3::prelude::*;
 
 pub mod attention;
 pub mod block_manager;
+#[cfg(feature = "cuda")]
+pub mod buffer_pool;
 mod constrained_decode;
 #[cfg(feature = "cuda")]
 pub mod cuda_runner;
@@ -9,6 +11,8 @@ pub mod engine;
 pub mod error;
 #[cfg(feature = "cuda")]
 pub mod gpu_context;
+#[cfg(feature = "cuda")]
+pub mod kv_cache;
 pub mod model_loader;
 pub mod model_runner_cpu;
 pub mod model_runner_py;
