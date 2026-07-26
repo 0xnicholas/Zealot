@@ -5,6 +5,8 @@ pub mod block_manager;
 mod constrained_decode;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "cuda")]
+pub mod gpu_context;
 pub mod model_loader;
 pub mod model_runner_cpu;
 pub mod model_runner_py;
