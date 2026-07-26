@@ -11,12 +11,18 @@ static ATTENTION_PTX: &str = include!(concat!(env!("OUT_DIR"), "/attention.ptx")
 static RMS_NORM_PTX: &str = include!(concat!(env!("OUT_DIR"), "/rms_norm.ptx"));
 #[cfg(feature = "cuda")]
 static EMBEDDING_PTX: &str = include!(concat!(env!("OUT_DIR"), "/embedding.ptx"));
+#[cfg(feature = "cuda")]
+static TRANSPOSE_PTX: &str = include!(concat!(env!("OUT_DIR"), "/transpose.ptx"));
+#[cfg(feature = "cuda")]
+static PAGED_ATTENTION_PTX: &str = include!(concat!(env!("OUT_DIR"), "/paged_attention.ptx"));
 
 #[cfg(feature = "cuda")]
 pub struct KernelModule {
     pub attention: CudaFunction,
     pub rms_norm: CudaFunction,
     pub embedding: CudaFunction,
+    pub transpose: CudaFunction,
+    pub paged_attention: CudaFunction,
 }
 
 #[cfg(feature = "cuda")]
@@ -31,6 +37,12 @@ impl KernelModule {
         let emb_mod = device
             .load_ptx(EMBEDDING_PTX.into(), "embedding_ptx", &[])
             .map_err(|e| ZealotError::Internal(format!("load embedding PTX: {e}")))?;
+        let trans_mod = device
+            .load_ptx(TRANSPOSE_PTX.into(), "transpose_ptx", &[])
+            .map_err(|e| ZealotError::Internal(format!("load transpose PTX: {e}")))?;
+        let pa_mod = device
+            .load_ptx(PAGED_ATTENTION_PTX.into(), "paged_attention_ptx", &[])
+            .map_err(|e| ZealotError::Internal(format!("load paged_attention PTX: {e}")))?;
 
         Ok(Self {
             attention: attn_mod
@@ -42,6 +54,12 @@ impl KernelModule {
             embedding: emb_mod
                 .get_fn("embedding_gather_kernel")
                 .map_err(|e| ZealotError::Internal(format!("get embedding fn: {e}")))?,
+            transpose: trans_mod
+                .get_fn("qkv_transpose_kernel")
+                .map_err(|e| ZealotError::Internal(format!("get transpose fn: {e}")))?,
+            paged_attention: pa_mod
+                .get_fn("paged_attention_kernel")
+                .map_err(|e| ZealotError::Internal(format!("get paged_attention fn: {e}")))?,
         })
     }
 }

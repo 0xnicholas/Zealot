@@ -25,7 +25,13 @@ fn compile_cuda_kernels() {
     let kernels_dir = Path::new("src/attention/kernels");
     let out_dir_val = std::env::var("OUT_DIR").unwrap();
     let out_dir = Path::new(&out_dir_val);
-    let cu_files = ["attention.cu", "rms_norm.cu", "embedding.cu"];
+    let cu_files = [
+        "attention.cu",
+        "rms_norm.cu",
+        "embedding.cu",
+        "transpose.cu",
+        "paged_attention.cu",
+    ];
 
     // Find nvcc
     let nvcc = match which::which("nvcc") {
