@@ -68,6 +68,9 @@ pub struct GpuLayerWeights {
     pub attn_proj: CudaSlice<f32>,
     pub rms_attn_weight: CudaSlice<f32>,
     pub rms_ffn_weight: CudaSlice<f32>,
+    pub gate_proj: CudaSlice<f32>,
+    pub up_proj: CudaSlice<f32>,
+    pub down_proj: CudaSlice<f32>,
 }
 
 /// GPU-side mirror of `ModelWeights`.  All weights reside in device memory
@@ -87,6 +90,7 @@ pub struct GpuWeights {
     pub head_dim: usize,
     pub num_layers: usize,
     pub vocab_size: usize,
+    pub intermediate_dim: usize,
     /// Multi-layer GPU weights.
     pub layers: Vec<GpuLayerWeights>,
     pub rms_final_weight: CudaSlice<f32>,
@@ -118,6 +122,9 @@ impl GpuWeights {
                     &layer.rms_ffn_weight,
                     &format!("layer[{i}].rms_ffn_weight"),
                 )?,
+                gate_proj: copy_in(&layer.gate_proj, &format!("layer[{i}].gate_proj"))?,
+                up_proj: copy_in(&layer.up_proj, &format!("layer[{i}].up_proj"))?,
+                down_proj: copy_in(&layer.down_proj, &format!("layer[{i}].down_proj"))?,
             });
         }
 
@@ -135,6 +142,7 @@ impl GpuWeights {
             head_dim: cpu.head_dim,
             num_layers: cpu.num_layers,
             vocab_size: cpu.vocab_size,
+            intermediate_dim: cpu.intermediate_dim,
             layers: gpu_layers,
             rms_final_weight: copy_in(&cpu.rms_final_weight, "rms_final_weight")?,
             num_kv_heads: cpu.num_kv_heads,

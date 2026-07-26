@@ -10,6 +10,9 @@ pub struct LayerWeights {
     pub attn_proj: Vec<f32>,
     pub rms_attn_weight: Vec<f32>,
     pub rms_ffn_weight: Vec<f32>,
+    pub gate_proj: Vec<f32>,   // [hidden_dim, intermediate_dim]
+    pub up_proj: Vec<f32>,     // [hidden_dim, intermediate_dim]
+    pub down_proj: Vec<f32>,   // [intermediate_dim, hidden_dim]
 }
 
 /// Weight and metadata extracted from a HuggingFace model via PyO3.
@@ -27,6 +30,7 @@ pub struct ModelWeights {
     pub head_dim: usize,
     pub num_layers: usize,
     pub vocab_size: usize,
+    pub intermediate_dim: usize,
     /// Multi-layer weights (for GPU runner).  Coexists with the scalar
     /// fields above (which CpuModelRunner still uses).
     pub layers: Vec<LayerWeights>,
@@ -175,6 +179,11 @@ pub fn load_weights(model_id: &str) -> Result<ModelWeights, ZealotError> {
             .map_err(py_err("num_hidden_layers"))?
             .extract()
             .map_err(py_err("num_hidden_layers"))?;
+        let intermediate_dim: usize = config
+            .getattr("intermediate_size")
+            .map_err(py_err("intermediate_size"))?
+            .extract()
+            .map_err(py_err("intermediate_size"))?;
 
         // ── Embedding ─────────────────────────────────────────────────
         let embedding = extract_direct_weight(
@@ -192,6 +201,12 @@ pub fn load_weights(model_id: &str) -> Result<ModelWeights, ZealotError> {
         let k_proj = extract_weight(&first_layer, attn_chains, "k_proj", "k_proj")?;
         let v_proj = extract_weight(&first_layer, attn_chains, "v_proj", "v_proj")?;
         let attn_proj = extract_weight(&first_layer, attn_chains, "o_proj", "o_proj")?;
+
+        // ── FFN weights ────────────────────────────────────────────
+        let mlp_chains: &[&[&str]] = &[&["mlp"]];
+        let gate_proj = extract_weight(&first_layer, mlp_chains, "gate_proj", "gate_proj")?;
+        let up_proj = extract_weight(&first_layer, mlp_chains, "up_proj", "up_proj")?;
+        let down_proj = extract_weight(&first_layer, mlp_chains, "down_proj", "down_proj")?;
 
         // ── RMS norm weights ──────────────────────────────────────────
         let rms_attn_chains: &[&[&str]] =
@@ -230,6 +245,9 @@ pub fn load_weights(model_id: &str) -> Result<ModelWeights, ZealotError> {
             attn_proj: attn_proj.clone(),
             rms_attn_weight: rms_attn_weight.clone(),
             rms_ffn_weight: rms_ffn_weight.clone(),
+            gate_proj: gate_proj.clone(),
+            up_proj: up_proj.clone(),
+            down_proj: down_proj.clone(),
         };
 
         Ok(ModelWeights {
@@ -246,6 +264,7 @@ pub fn load_weights(model_id: &str) -> Result<ModelWeights, ZealotError> {
             head_dim,
             num_layers,
             vocab_size,
+            intermediate_dim,
             layers: vec![first_layer_weights],
             num_kv_heads,
             rms_final_weight,
@@ -306,6 +325,11 @@ pub fn load_weights_all_layers(model_id: &str) -> Result<ModelWeights, ZealotErr
             .ok()
             .and_then(|v| v.extract().ok())
             .unwrap_or(num_heads);
+        let intermediate_dim: usize = config
+            .getattr("intermediate_size")
+            .map_err(py_err("intermediate_size"))?
+            .extract()
+            .map_err(py_err("intermediate_size"))?;
 
         // ── Embedding ─────────────────────────────────────────────────
         let embedding = extract_direct_weight(
@@ -346,6 +370,10 @@ pub fn load_weights_all_layers(model_id: &str) -> Result<ModelWeights, ZealotErr
             )?;
             let rms_ffn_weight = extract_direct_weight(&layer, rms_ffn_chains, &format!("layer[{i}].rms_ffn"))
                 .unwrap_or_else(|_| rms_attn_weight.clone());
+            let mlp_chains: &[&[&str]] = &[&["mlp"]];
+            let gate_proj = extract_weight(&layer, mlp_chains, "gate_proj", &format!("layer[{i}].gate_proj"))?;
+            let up_proj = extract_weight(&layer, mlp_chains, "up_proj", &format!("layer[{i}].up_proj"))?;
+            let down_proj = extract_weight(&layer, mlp_chains, "down_proj", &format!("layer[{i}].down_proj"))?;
 
             layers.push(LayerWeights {
                 q_proj,
@@ -354,6 +382,9 @@ pub fn load_weights_all_layers(model_id: &str) -> Result<ModelWeights, ZealotErr
                 attn_proj,
                 rms_attn_weight,
                 rms_ffn_weight,
+                gate_proj,
+                up_proj,
+                down_proj,
             });
         }
 
@@ -390,6 +421,7 @@ pub fn load_weights_all_layers(model_id: &str) -> Result<ModelWeights, ZealotErr
             head_dim,
             num_layers,
             vocab_size,
+            intermediate_dim,
             layers,
             num_kv_heads,
             rms_final_weight,
