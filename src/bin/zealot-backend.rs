@@ -19,8 +19,10 @@ use tokio_stream::{wrappers::ReceiverStream, wrappers::TcpListenerStream, Stream
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
 use zealot_engine::engine::{Engine, ModelRunner};
+use zealot_engine::error::ZealotError;
 use zealot_engine::model_runner_cpu::CpuModelRunner;
-use zealot_engine::model_runner_py::PyModelRunner;
+#[cfg(feature = "cuda")]
+use zealot_engine::cuda_runner::CudaModelRunner;
 use zealot_engine::sampling::SamplingParams;
 use zealot_engine::scheduler::{Priority, Scheduler, SchedulerConfig};
 use zealot_engine::tokenizer::Tokenizer;
@@ -281,20 +283,17 @@ impl InferenceRuntime for ZealotBackend {
 
         let model_id = req.model_id.clone();
         // 加载是重阻塞操作（HF 下载 + CPU 读盘），移出 tokio 工作线程
-        let runner: Box<dyn ModelRunner> = match tokio::task::spawn_blocking(move || {
-            if std::env::var("ZEALOT_USE_PYTHON").is_ok() {
-                PyModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>)
-            } else {
-                #[cfg(feature = "cuda")]
-                {
-                    CpuModelRunner::load_cuda(&model_id, 0)
-                        .map(|r| Box::new(r) as Box<dyn ModelRunner>)
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    CpuModelRunner::load(&model_id).map(|r| Box::new(r) as Box<dyn ModelRunner>)
+        let runner: Box<dyn ModelRunner> = match tokio::task::spawn_blocking(move || -> Result<Box<dyn ModelRunner>, ZealotError> {
+            #[cfg(feature = "cuda")]
+            {
+                match CudaModelRunner::load(&model_id, 0) {
+                    Ok(r) => return Ok(Box::new(r)),
+                    Err(e) => {
+                        tracing::warn!("GPU runner unavailable, falling back to CPU: {e}");
+                    }
                 }
             }
+            Ok(Box::new(CpuModelRunner::load(&model_id)?))
         })
         .await
         {
