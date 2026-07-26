@@ -54,6 +54,17 @@ impl GpuContext {
     }
 }
 
+/// GPU-side mirror of `LayerWeights`.  All layer weights reside in device memory.
+#[cfg(feature = "cuda")]
+pub struct GpuLayerWeights {
+    pub q_proj: CudaSlice<f32>,
+    pub k_proj: CudaSlice<f32>,
+    pub v_proj: CudaSlice<f32>,
+    pub attn_proj: CudaSlice<f32>,
+    pub rms_attn_weight: CudaSlice<f32>,
+    pub rms_ffn_weight: CudaSlice<f32>,
+}
+
 /// GPU-side mirror of `ModelWeights`.  All weights reside in device memory
 /// as `CudaSlice<f32>`.
 #[cfg(feature = "cuda")]
@@ -71,6 +82,10 @@ pub struct GpuWeights {
     pub head_dim: usize,
     pub num_layers: usize,
     pub vocab_size: usize,
+    /// Multi-layer GPU weights.
+    pub layers: Vec<GpuLayerWeights>,
+    pub rms_final_weight: CudaSlice<f32>,
+    pub num_kv_heads: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -82,6 +97,24 @@ impl GpuWeights {
             dev.htod_sync_copy(src)
                 .map_err(|e| ZealotError::Internal(format!("{label}: htod_sync_copy: {e}")))
         };
+
+        let mut gpu_layers = Vec::with_capacity(cpu.layers.len());
+        for (i, layer) in cpu.layers.iter().enumerate() {
+            gpu_layers.push(GpuLayerWeights {
+                q_proj: copy_in(&layer.q_proj, &format!("layer[{i}].q_proj"))?,
+                k_proj: copy_in(&layer.k_proj, &format!("layer[{i}].k_proj"))?,
+                v_proj: copy_in(&layer.v_proj, &format!("layer[{i}].v_proj"))?,
+                attn_proj: copy_in(&layer.attn_proj, &format!("layer[{i}].attn_proj"))?,
+                rms_attn_weight: copy_in(
+                    &layer.rms_attn_weight,
+                    &format!("layer[{i}].rms_attn_weight"),
+                )?,
+                rms_ffn_weight: copy_in(
+                    &layer.rms_ffn_weight,
+                    &format!("layer[{i}].rms_ffn_weight"),
+                )?,
+            });
+        }
 
         Ok(Self {
             embedding: copy_in(&cpu.embedding, "embedding")?,
@@ -97,6 +130,9 @@ impl GpuWeights {
             head_dim: cpu.head_dim,
             num_layers: cpu.num_layers,
             vocab_size: cpu.vocab_size,
+            layers: gpu_layers,
+            rms_final_weight: copy_in(&cpu.rms_final_weight, "rms_final_weight")?,
+            num_kv_heads: cpu.num_kv_heads,
         })
     }
 }
