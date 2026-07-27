@@ -61,33 +61,18 @@ impl CpuModelRunner {
 
     pub fn load(model_id: &str) -> Result<Self, ZealotError> {
         let weights = model_loader::load_weights(model_id)?;
-        let tokenizer_py = Python::with_gil(|py| -> Result<Option<Py<PyAny>>, ZealotError> {
+        let tokenizer_py = Python::with_gil(|py| -> Option<Py<PyAny>> {
             if let Ok(sp) = std::env::var("ZEALOT_SITE_PACKAGES") {
-                let sys = py
-                    .import("sys")
-                    .map_err(model_loader::py_err("import sys"))?;
-                sys.getattr("path")
-                    .map_err(model_loader::py_err("sys.path"))?
-                    .call_method1("insert", (0, sp))
-                    .map_err(model_loader::py_err("sys.path.insert"))?;
+                let sys = py.import("sys").ok()?;
+                sys.getattr("path").ok()?
+                    .call_method1("insert", (0, sp)).ok()?;
             }
-
-            let _torch = py
-                .import("torch")
-                .map_err(model_loader::py_err(
-                    "import torch (venv? set ZEALOT_SITE_PACKAGES)",
-                ))?;
-            let transformers = py
-                .import("transformers")
-                .map_err(model_loader::py_err("import transformers"))?;
-
+            let transformers = py.import("transformers").ok()?;
             let tokenizer = transformers
-                .getattr("AutoTokenizer")
-                .map_err(model_loader::py_err("AutoTokenizer"))?
-                .call_method1("from_pretrained", (model_id,))
-                .map_err(model_loader::py_err("tokenizer from_pretrained"))?;
-            Ok(Some(tokenizer.unbind()))
-        })?;
+                .getattr("AutoTokenizer").ok()?
+                .call_method1("from_pretrained", (model_id,)).ok()?;
+            Some(tokenizer.unbind())
+        });
 
         let eos_token_id: Option<i64> = tokenizer_py
             .as_ref()

@@ -10,17 +10,27 @@
 //! 目标形态：Python 仅在启动时加载权重，decode loop 全 Rust + CUDA（ADR-009）。
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::{
+    extract::State,
+    response::{sse::{Event, Sse}, IntoResponse},
+    routing::post,
+    Json, Router,
+};
+use axum::http::StatusCode;
+use futures::StreamExt;
 use tokio_stream::{wrappers::ReceiverStream, wrappers::TcpListenerStream, Stream};
-use tonic::{transport::Server, Request, Response, Status, Streaming};
+use tonic::{transport::Server, Request, Status, Streaming};
 
 use zealot_engine::engine::{Engine, ModelRunner};
 use zealot_engine::error::ZealotError;
 use zealot_engine::model_runner_cpu::CpuModelRunner;
+use zealot_engine::openai::{self, ChatCompletionRequest};
 #[cfg(feature = "cuda")]
 use zealot_engine::cuda_runner::CudaModelRunner;
 use zealot_engine::sampling::SamplingParams;
@@ -61,20 +71,20 @@ enum EngineCmd {
     Shutdown,
 }
 
-struct EngineHandle {
+struct SlotHandle {
     cmd_tx: std::sync::mpsc::Sender<EngineCmd>,
     model: LoadedModel,
 }
 
-enum EngineSlot {
+enum ModelSlot {
     Empty,
     Loading,
-    Ready(EngineHandle),
+    Ready(SlotHandle),
 }
 
-impl Default for EngineSlot {
+impl Default for ModelSlot {
     fn default() -> Self {
-        EngineSlot::Empty
+        ModelSlot::Empty
     }
 }
 
@@ -208,13 +218,13 @@ fn run_engine(mut engine: Engine, eos: Option<i64>, cmd_rx: std::sync::mpsc::Rec
 
 // ── gRPC service ─────────────────────────────────────
 
-#[derive(Default)]
-struct ZealotBackend {
-    slot: Mutex<EngineSlot>,
+#[derive(Clone, Default)]
+struct Runtime {
+    slot: Arc<Mutex<ModelSlot>>,
 }
 
-impl ZealotBackend {
-    fn lock_slot(&self) -> Result<std::sync::MutexGuard<'_, EngineSlot>, Status> {
+impl Runtime {
+    fn lock_slot(&self) -> Result<std::sync::MutexGuard<'_, ModelSlot>, Status> {
         self.slot
             .lock()
             .map_err(|_| Status::internal("engine slot lock poisoned"))
@@ -254,24 +264,24 @@ fn infer_params_to_sampling(params: &runtime_v1::InferParams) -> SamplingParams 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tonic::async_trait]
-impl InferenceRuntime for ZealotBackend {
+impl InferenceRuntime for Runtime {
     // ── 模型生命周期 ──────────────────────────────────────
 
     async fn load_model(
         &self,
         request: Request<LoadModelRequest>,
-    ) -> Result<Response<LoadModelResponse>, Status> {
+    ) -> Result<tonic::Response<LoadModelResponse>, Status> {
         let req = request.into_inner();
         {
             let slot = self.lock_slot()?;
             match &*slot {
-                EngineSlot::Empty => {}
-                EngineSlot::Loading => {
+                ModelSlot::Empty => {}
+                ModelSlot::Loading => {
                     return Err(Status::failed_precondition(
                         "a model load is already in progress",
                     ))
                 }
-                EngineSlot::Ready(h) => {
+                ModelSlot::Ready(h) => {
                     return Err(Status::already_exists(format!(
                         "model '{}' already loaded; UnloadModel first",
                         h.model.model_id
@@ -279,7 +289,7 @@ impl InferenceRuntime for ZealotBackend {
                 }
             }
         }
-        *self.lock_slot()? = EngineSlot::Loading;
+        *self.lock_slot()? = ModelSlot::Loading;
 
         let model_id = req.model_id.clone();
         // 加载是重阻塞操作（HF 下载 + CPU 读盘），移出 tokio 工作线程
@@ -299,11 +309,11 @@ impl InferenceRuntime for ZealotBackend {
         {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
-                *self.lock_slot()? = EngineSlot::Empty;
+                *self.lock_slot()? = ModelSlot::Empty;
                 return Err(Status::internal(format!("model load failed: {e}")));
             }
             Err(e) => {
-                *self.lock_slot()? = EngineSlot::Empty;
+                *self.lock_slot()? = ModelSlot::Empty;
                 return Err(Status::internal(format!("load task failed: {e}")));
             }
         };
@@ -325,8 +335,8 @@ impl InferenceRuntime for ZealotBackend {
             gpu_count: 0, // CPU dev-mode
             ready: true,
         };
-        *self.lock_slot()? = EngineSlot::Ready(EngineHandle { cmd_tx, model });
-        Ok(Response::new(LoadModelResponse {
+        *self.lock_slot()? = ModelSlot::Ready(SlotHandle { cmd_tx, model });
+        Ok(tonic::Response::new(LoadModelResponse {
             model_id: req.model_id,
             ready: true,
             message: "loaded on CPU (dev-mode PyTorch runner)".into(),
@@ -336,22 +346,22 @@ impl InferenceRuntime for ZealotBackend {
     async fn unload_model(
         &self,
         request: Request<UnloadModelRequest>,
-    ) -> Result<Response<UnloadModelResponse>, Status> {
+    ) -> Result<tonic::Response<UnloadModelResponse>, Status> {
         let req = request.into_inner();
-        let taken = std::mem::replace(&mut *self.lock_slot()?, EngineSlot::Empty);
+        let taken = std::mem::replace(&mut *self.lock_slot()?, ModelSlot::Empty);
         match taken {
-            EngineSlot::Empty => Ok(Response::new(UnloadModelResponse {
+            ModelSlot::Empty => Ok(tonic::Response::new(UnloadModelResponse {
                 model_id: req.model_id,
                 unloaded: false,
                 message: "no model loaded".into(),
             })),
-            EngineSlot::Loading => {
-                *self.lock_slot()? = EngineSlot::Loading;
+            ModelSlot::Loading => {
+                *self.lock_slot()? = ModelSlot::Loading;
                 Err(Status::failed_precondition("load in progress"))
             }
-            EngineSlot::Ready(h) => {
+            ModelSlot::Ready(h) => {
                 let _ = h.cmd_tx.send(EngineCmd::Shutdown);
-                Ok(Response::new(UnloadModelResponse {
+                Ok(tonic::Response::new(UnloadModelResponse {
                     model_id: req.model_id,
                     unloaded: true,
                     message: String::new(),
@@ -363,12 +373,12 @@ impl InferenceRuntime for ZealotBackend {
     async fn list_models(
         &self,
         _request: Request<ListModelsRequest>,
-    ) -> Result<Response<ListModelsResponse>, Status> {
+    ) -> Result<tonic::Response<ListModelsResponse>, Status> {
         let models = match &*self.lock_slot()? {
-            EngineSlot::Ready(h) => vec![h.model.clone()],
+            ModelSlot::Ready(h) => vec![h.model.clone()],
             _ => vec![],
         };
-        Ok(Response::new(ListModelsResponse { models }))
+        Ok(tonic::Response::new(ListModelsResponse { models }))
     }
 
     // ── 推理执行（双向流）────────────────────────────────
@@ -378,7 +388,7 @@ impl InferenceRuntime for ZealotBackend {
     async fn infer(
         &self,
         request: Request<Streaming<InferRequest>>,
-    ) -> Result<Response<Self::InferStream>, Status> {
+    ) -> Result<tonic::Response<Self::InferStream>, Status> {
         let mut inbound = request.into_inner();
         let first = inbound
             .message()
@@ -393,8 +403,8 @@ impl InferenceRuntime for ZealotBackend {
         let cmd_tx = {
             let slot = self.lock_slot()?;
             match &*slot {
-                EngineSlot::Ready(h) if h.model.model_id == first.model => h.cmd_tx.clone(),
-                EngineSlot::Ready(h) => {
+                ModelSlot::Ready(h) if h.model.model_id == first.model => h.cmd_tx.clone(),
+                ModelSlot::Ready(h) => {
                     return Err(Status::not_found(format!(
                         "model '{}' not loaded (loaded: '{}')",
                         first.model, h.model.model_id
@@ -463,7 +473,7 @@ impl InferenceRuntime for ZealotBackend {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(tonic::Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
     // ── 批处理（后续里程碑）──────────────────────────────
@@ -471,7 +481,7 @@ impl InferenceRuntime for ZealotBackend {
     async fn submit_batch(
         &self,
         _request: Request<BatchRequest>,
-    ) -> Result<Response<BatchResponse>, Status> {
+    ) -> Result<tonic::Response<BatchResponse>, Status> {
         Err(Status::unimplemented(
             "SubmitBatch lands with the Rust Scheduler (Phase 2 M5+)",
         ))
@@ -480,7 +490,7 @@ impl InferenceRuntime for ZealotBackend {
     async fn get_batch_status(
         &self,
         _request: Request<BatchStatusRequest>,
-    ) -> Result<Response<BatchStatusResponse>, Status> {
+    ) -> Result<tonic::Response<BatchStatusResponse>, Status> {
         Err(Status::unimplemented(
             "GetBatchStatus lands with the Rust Scheduler (Phase 2 M5+)",
         ))
@@ -491,14 +501,14 @@ impl InferenceRuntime for ZealotBackend {
     async fn health_check(
         &self,
         _request: Request<HealthCheckRequest>,
-    ) -> Result<Response<HealthCheckResponse>, Status> {
+    ) -> Result<tonic::Response<HealthCheckResponse>, Status> {
         // GPU 指标在 DCGM 接入前为 0。
         let status = match &*self.lock_slot()? {
-            EngineSlot::Ready(_) => HealthStatus::Healthy,
-            EngineSlot::Loading => HealthStatus::Degraded,
-            EngineSlot::Empty => HealthStatus::Healthy,
+            ModelSlot::Ready(_) => HealthStatus::Healthy,
+            ModelSlot::Loading => HealthStatus::Degraded,
+            ModelSlot::Empty => HealthStatus::Healthy,
         };
-        Ok(Response::new(HealthCheckResponse {
+        Ok(tonic::Response::new(HealthCheckResponse {
             status: status as i32,
             queue_depth: 0,
             gpu_util_pct: 0.0,
@@ -512,7 +522,7 @@ impl InferenceRuntime for ZealotBackend {
     async fn stream_metrics(
         &self,
         _request: Request<()>,
-    ) -> Result<Response<Self::StreamMetricsStream>, Status> {
+    ) -> Result<tonic::Response<Self::StreamMetricsStream>, Status> {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -535,27 +545,199 @@ impl InferenceRuntime for ZealotBackend {
                 }
             }
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(tonic::Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+}
+
+// ── OpenAI HTTP handler ─────────────────────────────
+
+async fn health_check(
+    State(backend): State<Runtime>,
+) -> Json<serde_json::Value> {
+    let status = match backend.slot.lock() {
+        Ok(slot) => match &*slot {
+            ModelSlot::Ready(h) => serde_json::json!({
+                "status": "healthy",
+                "model": h.model.model_id,
+                "ready": true,
+            }),
+            ModelSlot::Loading => serde_json::json!({
+                "status": "degraded",
+                "model": null,
+                "ready": false,
+            }),
+            ModelSlot::Empty => serde_json::json!({
+                "status": "healthy",
+                "model": null,
+                "ready": false,
+            }),
+        },
+        Err(_) => serde_json::json!({"status": "unhealthy", "ready": false}),
+    };
+    Json(status)
+}
+
+async fn handle_openai_chat(
+    State(backend): State<Runtime>,
+    Json(body): Json<ChatCompletionRequest>,
+) -> axum::response::Response {
+    let (model_id, cmd_tx) = {
+        let slot = match backend.slot.lock() {
+            Ok(s) => s,
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine slot lock poisoned"}))).into_response(),
+        };
+        match &*slot {
+            ModelSlot::Ready(h) => (h.model.model_id.clone(), h.cmd_tx.clone()),
+            _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "no model loaded"}))).into_response(),
+        }
+    };
+
+    let request_id = format!("chatcmpl-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let messages: Vec<(String, String)> = body.messages.into_iter().map(|m| (m.role, m.content)).collect();
+    let max_tokens = body.max_tokens.unwrap_or(32).min(512) as usize;
+
+    let sampling_params = zealot_engine::sampling::SamplingParams {
+        temperature: body.temperature,
+        top_k: 0,
+        top_p: body.top_p,
+        repetition_penalty: 1.0,
+        frequency_penalty: body.frequency_penalty,
+        presence_penalty: body.presence_penalty,
+        seed: body.seed,
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    if cmd_tx.send(EngineCmd::Infer {
+        request_id: request_id.clone(),
+        messages,
+        max_tokens,
+        priority: Priority::Medium,
+        sampling_params,
+        tx,
+    }).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine thread gone"}))).into_response();
+    }
+
+    if body.stream {
+        streaming_response(rx, &request_id, &model_id, ts).into_response()
+    } else {
+        non_streaming_response(rx, &request_id, &model_id, ts).await.into_response()
+    }
+}
+
+fn streaming_response(
+    rx: tokio::sync::mpsc::Receiver<Result<InferResponse, tonic::Status>>,
+    request_id: &str,
+    model: &str,
+    ts: u64,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let rid = request_id.to_owned();
+    let mdl = model.to_owned();
+    let stream = ReceiverStream::new(rx).flat_map(move |frame| {
+        let mut events: Vec<Result<Event, Infallible>> = Vec::new();
+        match frame {
+            Ok(resp) => match resp.payload {
+                Some(Payload::Delta(d)) => {
+                    let json = serde_json::to_string(&openai::sse_content(&rid, &mdl, ts, &d.text)).unwrap_or_default();
+                    events.push(Ok(Event::default().data(json)));
+                }
+                Some(Payload::Final(f)) => {
+                    let pt = f.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
+                    let ct = f.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+                    let json = serde_json::to_string(&openai::sse_finish(&rid, &mdl, ts, &f.finish_reason, pt, ct)).unwrap_or_default();
+                    events.push(Ok(Event::default().data(json)));
+                    events.push(Ok(Event::default().data("[DONE]")));
+                }
+                None => {}
+            },
+            Err(_) => {}
+        }
+        futures::stream::iter(events)
+    });
+    Sse::new(stream)
+}
+
+async fn non_streaming_response(
+    rx: tokio::sync::mpsc::Receiver<Result<InferResponse, tonic::Status>>,
+    request_id: &str,
+    model: &str,
+    ts: u64,
+) -> Json<serde_json::Value> {
+    let mut content = String::new();
+    let mut finish_reason = String::from("stop");
+    let mut prompt_tokens = 0u32;
+    let mut completion_tokens = 0u32;
+
+    let mut stream = ReceiverStream::new(rx);
+    while let Some(frame) = stream.next().await {
+        match frame {
+            Ok(resp) => match resp.payload {
+                Some(Payload::Delta(d)) => content.push_str(&d.text),
+                Some(Payload::Final(f)) => {
+                    finish_reason = f.finish_reason;
+                    if let Some(u) = f.usage {
+                        prompt_tokens = u.prompt_tokens;
+                        completion_tokens = u.completion_tokens;
+                    }
+                }
+                None => {}
+            },
+            Err(_) => break,
+        }
+    }
+
+    let json = openai::non_streaming_response(
+        request_id, model, ts, content, finish_reason,
+        prompt_tokens, completion_tokens,
+    );
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+    Json(value)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 嵌入式 CPython：Model Loader / dev-mode runner 用（ADR-009）
     pyo3::prepare_freethreaded_python();
 
-    let port: u16 = std::env::var("ZEALOT_GRPC_PORT")
+    let grpc_port: u16 = std::env::var("ZEALOT_GRPC_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9091);
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
-    let local = listener.local_addr()?;
-    // 集成测试解析这一行获取实际端口（端口 0 时）。
-    println!("zealot-backend listening on {local}");
+    let http_port: u16 = std::env::var("ZEALOT_HTTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8081);
 
-    Server::builder()
-        .add_service(InferenceRuntimeServer::new(ZealotBackend::default()))
-        .serve_with_incoming(TcpListenerStream::new(listener))
-        .await?;
+    let backend = Runtime::default();
+
+    // gRPC server
+    let grpc_listener = tokio::net::TcpListener::bind(("0.0.0.0", grpc_port)).await?;
+    let grpc_addr = grpc_listener.local_addr()?;
+    let grpc_backend = backend.clone();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(InferenceRuntimeServer::new(grpc_backend))
+            .serve_with_incoming(TcpListenerStream::new(grpc_listener))
+            .await
+            .expect("gRPC server failed");
+    });
+
+    // HTTP server
+    let http_listener = tokio::net::TcpListener::bind(("0.0.0.0", http_port)).await?;
+    let http_addr = http_listener.local_addr()?;
+    // First stdout line is parsed by tests (common/mod.rs). Must keep format.
+    println!("zealot-backend listening on {grpc_addr} (gRPC) {http_addr} (HTTP)");
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/health", axum::routing::get(health_check))
+        .route("/ready", axum::routing::get(health_check))
+        .with_state(backend);
+
+    axum::serve(http_listener, app).await?;
     Ok(())
 }

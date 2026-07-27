@@ -26,6 +26,7 @@ pub async fn spawn_backend() -> (ChildGuard, String) {
     let exe = env!("CARGO_BIN_EXE_zealot-backend");
     let mut child = Command::new(exe)
         .env("ZEALOT_GRPC_PORT", "0")
+        .env("ZEALOT_HTTP_PORT", "0")
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn zealot-backend");
@@ -39,11 +40,16 @@ pub async fn spawn_backend() -> (ChildGuard, String) {
     })
     .await
     .expect("join stdout reader");
-    let addr = line
+    // Format: "zealot-backend listening on <gRPC-addr> (gRPC) <HTTP-addr> (HTTP)"
+    let rest = line
         .strip_prefix("zealot-backend listening on ")
-        .expect("listen address line")
+        .expect("listen address line");
+    let grpc_addr = rest
+        .split(" (gRPC)")
+        .next()
+        .unwrap_or(rest)
         .replace("0.0.0.0", "127.0.0.1");
-    (ChildGuard(child), addr)
+    (ChildGuard(child), grpc_addr)
 }
 
 pub fn stream_start(request_id: &str, model: &str) -> InferRequest {
