@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "zealot"
 version = "0.1.0"
 requires-python = ">=3.10"
-description = "Ultralisk Inference Engine — standalone Rust engine (ADR-009)"
+description = "Zealot — standalone Rust inference engine, no vLLM fork. Sole consumer: Ultralisk inference platform."
 
 [tool.maturin]
 module-name = "zealot_engine"

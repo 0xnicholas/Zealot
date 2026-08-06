@@ -2,7 +2,7 @@
 name = "zealot-engine"
 version = "0.1.0"
 edition = "2021"
-description = "Ultralisk Inference Engine — standalone Rust engine, no vLLM fork (ADR-009)"
+description = "Zealot — standalone Rust inference engine, no vLLM fork. Sole consumer: Ultralisk inference platform."
 
 [lib]
 name = "zealot_engine"

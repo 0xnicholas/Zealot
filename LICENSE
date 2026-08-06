@@ -1,0 +1,19 @@
+# Zealot — Proprietary License
+
+Copyright (c) 2026 Ultralisk. All rights reserved.
+
+This software (the "Software") is proprietary and confidential. No license,
+express or implied, is granted to any party to use, copy, modify, merge,
+publish, distribute, sublicense, or sell copies of the Software, or to permit
+others to do so, without the prior written permission of the copyright holder.
+
+The Software is provided "AS IS", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability,
+fitness for a particular purpose, and noninfringement. In no event shall the
+authors or copyright holders be liable for any claim, damages, or other
+liability, whether in an action of contract, tort, or otherwise, arising from,
+out of, or in connection with the Software or the use or other dealings in the
+Software.
+
+The sole consumer of this Software is the Ultralisk inference platform
+(see ADR-013 in the Ultralisk repository).

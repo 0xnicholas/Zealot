@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['zealot-v*']   # 发布 tag：zealot-vX.Y.Z
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true  # clippy nits shouldn't gate CI yet
+
+      - name: cargo test
+        run: cargo test --all-targets --no-fail-fast
+        env:
+          # CPU e2e 需要 venv + HF 模型，未配置时自动跳过（tests/cpu_infer_e2e.rs）
+          ZEALOT_E2E_MODEL: ""

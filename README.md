@@ -1,22 +1,24 @@
-# Zealot — Ultralisk 推理引擎
+# Zealot — Rust 推理引擎
 
+> 独立闭源项目。唯一消费者：Ultralisk 推理云平台（绑平台，不独立商业化）。
+> 决策记录：Ultralisk 仓库 `docs/adr/013-zealot-standalone-project.md`。
 > 架构设计文档：[docs/architecture.md](docs/architecture.md)
 
 ## 定位
 
-Zealot 是 Ultralisk 的自研推理引擎，目标是在 Phase 3 替代 vLLM 成为默认推理引擎，性能达到 Together TIE 的 80%+。
+Zealot 是 Ultralisk 推理云平台的自研推理引擎，目标是在 Phase 3 替代 vLLM 成为平台默认引擎，性能达到 Together TIE 的 80%+（里程碑：M3.1 达 vLLM vanilla 2x，M3.3 达 TIE 80%）。
 
-**策略**：独立引擎，不从 vLLM fork 起步。Zealot 以 Rust 主进程运行（tonic gRPC），Python 仅通过 PyO3 嵌入用于 HuggingFace Model Loader。关键路径（Block Manager → Constrained Decode → Scheduler）直接以 Rust 原生实现，无"先注入 vLLM 再脱离"的过渡阶段。
+**策略**：独立引擎，不从 vLLM fork 起步。Zealot 以 Rust 主进程运行（tonic gRPC + HTTP OpenAI endpoint），Python 仅通过 PyO3 嵌入用于 HuggingFace Model Loader。关键路径（Block Manager → Constrained Decode → Scheduler）直接以 Rust 原生实现，无"先注入 vLLM 再脱离"的过渡阶段。
 
-**相关 ADR**：[003](../docs/adr/003-inference-engine-vllm.md)、[009](../docs/adr/009-zealot-language-strategy.md)、[010](../docs/adr/010-backend-runtime.md)
+**kill criterion**：若在既定里程碑未达到 benchmark 目标，平台回退 vLLM，本项目冻结为研究项目，不绑架平台（见 ADR-013）。
 
 ## 语言分工
 
 ```
-Rust   ──→ 主进程：gRPC Server (tonic) + Scheduler
-           + Block Manager + Constrained Decode
+Rust   ──→ 主进程：gRPC Server (tonic) + HTTP OpenAI endpoint
+           + Scheduler + Block Manager + Constrained Decode
 Python ──→ Model Loader                 ← PyO3 嵌入，仅启动时加载权重（HF 生态）
-CUDA   ──→ Attention / Quant Kernel     ← 改装优化，不重写
+CUDA   ──→ Attention / Quant Kernel     ← 改装优化，不重写（闭源，护城河）
 ```
 
 ## 项目结构
@@ -24,9 +26,11 @@ CUDA   ──→ Attention / Quant Kernel     ← 改装优化，不重写
 ```
 zealot/
 ├── Cargo.toml               # lib (cdylib → zealot_engine.abi3.so) + bin (zealot-backend)
-├── build.rs                  # tonic-build 编译 ../proto Runtime Interface（protoc vendored）
+├── build.rs                  # tonic-build 编译 proto/ Runtime Interface（protoc vendored）
+├── proto/                    # Runtime Interface 契约（随本仓库独立维护）
 ├── pyproject.toml            # maturin build config
 ├── README.md
+├── CHANGELOG.md
 ├── src/
 │   ├── lib.rs                # PyO3 #[pymodule] 入口
 │   ├── error.rs              # 错误类型 + PyErr 转换
@@ -39,7 +43,7 @@ zealot/
 │   ├── engine.rs             # Engine 步进循环 + ModelRunner trait
 │   ├── model_runner_py.rs    # PyModelRunner：PyO3 嵌入 torch CPU 前向（dev-mode）
 │   └── bin/
-│       └── zealot-backend.rs # Runtime Interface gRPC server（ADR-010，Engine actor，:9091）
+│       └── zealot-backend.rs # Runtime Interface gRPC server + HTTP OpenAI endpoint
 └── tests/                    # backend_e2e.rs + cpu_infer_e2e.rs（真实模型 CPU 端到端）+ pytest
 ```
 
@@ -85,7 +89,7 @@ grammar.advance(state, token)  # → int (next state)
 
 ```
 Phase 2（M4-M6，当前）
-  Zealot Backend（独立 Rust 进程，tonic gRPC）
+  Zealot Backend（独立 Rust 进程，tonic gRPC + HTTP OpenAI）
       ├── Rust: Block Manager, Constrained Decode, Scheduler
       │         （Scheduler 逻辑等价 vLLM continuous batching）
       ├── CUDA: Attention / Quant Kernel
@@ -96,7 +100,7 @@ Phase 2（M4-M6，当前）
     Scheduler/Engine/协议链路；GPU kernel 就位后回归"仅启动时加载"设计。
 
 Phase 3（M7-M12，目标）
-  Zealot 成为默认引擎
+  Zealot 成为平台默认引擎
       ├── Scheduler 增强：Prefill-Decode 分离、Speculative Decoding、RadixAttention
       └── 性能目标：Together TIE 的 80%+
 ```
@@ -110,7 +114,7 @@ Phase 3（M7-M12，目标）
 # 开发
 cargo build
 
-# gRPC server（Runtime Interface，ADR-010；Engine actor 模式）
+# gRPC server（Runtime Interface；Engine actor 模式）
 cargo run --bin zealot-backend    # 端口 ZEALOT_GRPC_PORT，默认 :9091
 
 # 生成 Python 扩展
@@ -152,4 +156,8 @@ cargo test --test cpu_infer_e2e -- --nocapture
 
 ## 新模型支持
 
-Zealot 不 fork vLLM，无 upstream rebase 负担。新模型支持依赖 HuggingFace transformers：新模型在 transformers 发布后，升级 Python 侧依赖即可获得，Rust 核心无需改动。目标适配速度不慢于 vLLM 社区的 1-2 周（ADR-009 约束）。
+Zealot 不 fork vLLM，无 upstream rebase 负担。新模型支持依赖 HuggingFace transformers：新模型在 transformers 发布后，升级 Python 侧依赖即可获得，Rust 核心无需改动。目标适配速度不慢于 vLLM 社区的 1-2 周。
+
+## License
+
+专有闭源（Proprietary）。见 [LICENSE](LICENSE)。本仓库不开放外部贡献。
