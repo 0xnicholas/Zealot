@@ -667,6 +667,63 @@ mod tests {
     }
 
     #[test]
+    fn resolve_integer_constrained_tool_param_walks() {
+        // M5-⑤：工具参数 integer 范围约束真实执行——信封 walk 校验
+        let r = req(
+            r#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"get_age","parameters":{"type":"object","properties":{"age":{"type":"integer","minimum":0,"maximum":100}},"required":["age"],"additionalProperties":false}}}],"tool_choice":{"type":"function","function":{"name":"get_age"}}}"#,
+        );
+        let g = resolve_grammar(
+            &compiler(),
+            r.response_format.as_ref(),
+            r.tools.as_deref(),
+            r.tool_choice.as_ref(),
+        )
+        .expect("resolve")
+        .expect("grammar");
+        // 真实词表 walk（占位模式不经过自动机）：256 个单字节 token（id == 字节值）
+        // + 多字节 token（name/arguments/age 等，id ≥ 256）
+        let mut vocab: Vec<Option<String>> =
+            (0..=255u8).map(|b| Some((b as char).to_string())).collect();
+        for t in ["name", "get_age", "arguments", "age"] {
+            vocab.push(Some(t.to_string()));
+        }
+        let tok = crate::tokenizer::Tokenizer::from_vocab(vocab, true);
+        let walk_bytes = |g: &ConstrainedGrammar, bytes: &[u8]| -> bool {
+            let mut st = 0usize;
+            for &b in bytes {
+                let id = b as i64;
+                if !g.allowed_tokens_for(st, Some(&tok)).contains(&(id as i32)) {
+                    return false;
+                }
+                st = g.advance_state(st, id, Some(&tok));
+            }
+            g.is_valid_final_state(st, Some(&tok))
+        };
+        let ok = b"{\"name\":\"get_age\",\"arguments\":{\"age\":42}}";
+        assert!(walk_bytes(&g, ok), "in-range walk");
+        let bad = b"{\"name\":\"get_age\",\"arguments\":{\"age\":101}}";
+        assert!(!walk_bytes(&g, bad), "101 超出上限应拒绝");
+        let bad2 = b"{\"name\":\"get_age\",\"arguments\":{\"age\":-1}}";
+        assert!(!walk_bytes(&g, bad2), "-1 低于下限应拒绝");
+    }
+
+    #[test]
+    fn resolve_integer_conflicting_range_errors() {
+        // 空区间/过大 multipleOf → 400 面错误（不产出死 grammar）
+        let r = req(
+            r#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"x":{"type":"integer","minimum":10,"maximum":5}},"required":["x"],"additionalProperties":false}}}],"tool_choice":{"type":"function","function":{"name":"f"}}}"#,
+        );
+        let err = resolve_grammar(
+            &compiler(),
+            r.response_format.as_ref(),
+            r.tools.as_deref(),
+            r.tool_choice.as_ref(),
+        )
+        .expect_err("空区间应报错");
+        assert!(err.contains("空区间"), "{err}");
+    }
+
+    #[test]
     fn resolve_tool_choice_auto_is_unconstrained() {
         let r = req(
             r#"{"model":"m","messages":[],"tools":[{"type":"function","function":{"name":"f1","parameters":{"type":"object","additionalProperties":false}}}],"tool_choice":"auto"}"#,

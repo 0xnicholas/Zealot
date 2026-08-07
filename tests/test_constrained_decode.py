@@ -213,3 +213,59 @@ def test_compile_timeout_guard():
     schema = {"type": "object", "properties": props}
     with pytest.raises(RuntimeError, match="timed out"):
         c.compile(json.dumps(schema))
+
+
+def test_integer_range_keywords_compile():
+    """M5-⑤：integer min/max/exclusive*/multipleOf 解析并编译（不报错）。"""
+    c = make_compiler()
+    for schema in [
+        {"type": "integer"},
+        {"type": "integer", "minimum": 0},
+        {"type": "integer", "maximum": 100},
+        {"type": "integer", "minimum": -10, "maximum": 10, "multipleOf": 2},
+        {"type": "integer", "exclusiveMinimum": 0, "exclusiveMaximum": 100},
+        {"type": "integer", "minimum": 0, "exclusiveMinimum": True},  # draft-4 形态
+        {"type": "integer", "multipleOf": 2.5},  # 小数展开
+    ]:
+        g = c.compile(json.dumps(schema))
+        assert isinstance(g, ze.ConstrainedGrammar)
+
+
+def test_integer_invalid_range_rejected():
+    """M5-⑤：空区间 / multipleOf 0 / number+范围 → 显式错误（不静默）。"""
+    c = make_compiler()
+    with pytest.raises(RuntimeError, match="空区间"):
+        c.compile(json.dumps({"type": "integer", "minimum": 10, "maximum": 5}))
+    with pytest.raises(RuntimeError, match="multipleOf"):
+        c.compile(json.dumps({"type": "integer", "multipleOf": 0}))
+    with pytest.raises(RuntimeError, match="integer"):
+        c.compile(json.dumps({"type": "number", "minimum": 0}))
+    with pytest.raises(RuntimeError, match="multipleOf"):
+        c.compile(json.dumps({"type": "integer", "multipleOf": 0.1234567}))
+
+
+def test_integer_range_walk_with_vocab(tmp_path):
+    """M5-⑤：真实词表 walk——[0,100] 内合法、越界被 mask 拒。"""
+    vocab = {chr(i): i for i in range(256)}  # 单字节词表（id == 字节值）
+    tok_path = tmp_path / "tokenizer.json"
+    tok_path.write_text(json.dumps({"model": {"type": "BPE", "vocab": vocab}}))
+
+    c = make_compiler()
+    g = c.compile(json.dumps({"type": "integer", "minimum": 0, "maximum": 100}))
+    g.load_tokenizer(str(tok_path))
+
+    def walk_ok(gs, text):
+        st = 0
+        for ch in text:
+            tid = ord(ch)
+            if tid not in gs.allowed_tokens(st):
+                return False
+            st = gs.advance(st, tid)
+        return gs.is_valid_final(st)
+
+    assert walk_ok(g, "0")
+    assert walk_ok(g, "42")
+    assert walk_ok(g, "100")
+    assert not walk_ok(g, "-1"), "低于下限应被拒"
+    assert not walk_ok(g, "101"), "超出上限应被拒"
+    assert not walk_ok(g, "007"), "前导零应被拒"

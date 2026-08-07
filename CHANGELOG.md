@@ -7,6 +7,18 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-⑤：整数数值范围关键字执行（issue #19）——`GrammarType::Integer` 结构化
+  （修死代码：integer 与 number 分离，integer 不再接受小数点/指数）；schema 解析
+  `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`/`multipleOf`（draft-7
+  数字形态 + draft-4 布尔形态，exclusive 取更严；小数 multipleOf 十进制展开 ≤6 位）；
+  自动机层：有界区间十进制 digit-DP（状态 (pos, ca, cb, rem)，ca/cb 为前缀与
+  上下界数字串的 LT/EQ/GT 比较，rem 为 multipleOf 余数；规范形式无前导零，
+  负区间 `-`+幅度，`-0` 拒绝），纯 multipleOf 用余数 DFA；活状态剪枝——
+  「可到达但必死」前缀（如 [0,100] 的 101）不建不接，杜绝 mask 全空 → 引擎
+  fallback 垃圾；空区间/超大 multipleOf（预算超限）→ 显式编译错误（不静默），
+  automaton 编译错误透传（不再一律 SchemaTooComplex）；`number` 类型带范围关键字
+  → 显式报错（浮点区间暂不支持，请用 integer）；工具参数整数区间端到端生效
+  （信封 walk + mock HTTP e2e 验证 [0,1] 取 1）
 - M5-④：openai.rs response_format / tools 接入（issue #18）——ChatCompletionRequest
   新增 `response_format`（text/json_object/json_schema）与 `tools`/`tool_choice`；
   json_schema 经 CD 编译链路约束解码（strict 校验：根 object、全属性 required、

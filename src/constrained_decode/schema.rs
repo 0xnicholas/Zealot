@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::matcher::{ConstrainedGrammar, GrammarType};
+use super::matcher::{ConstrainedGrammar, GrammarType, MultipleOf};
 use crate::error::ZealotError;
 
 const MAX_NESTING_DEPTH: usize = 32;
@@ -151,7 +151,22 @@ fn compile_schema(
     let grammar_type = if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
         match type_str {
             "string" => compile_string(schema, max_states, depth)?,
-            "number" | "integer" => GrammarType::Number,
+            "number" => {
+                if schema.get("minimum").is_some()
+                    || schema.get("maximum").is_some()
+                    || schema.get("exclusiveMinimum").is_some()
+                    || schema.get("exclusiveMaximum").is_some()
+                    || schema.get("multipleOf").is_some()
+                {
+                    // M5-⑤：范围约束仅 integer 可执行；number（浮点）不静默丢弃——显式报错
+                    return Err(ZealotError::SchemaCompileError(
+                        "number 类型的 minimum/maximum/exclusive*/multipleOf 约束暂不支持（请改用 integer）"
+                            .into(),
+                    ));
+                }
+                GrammarType::Number
+            }
+            "integer" => compile_integer(schema)?,
             "boolean" => GrammarType::Boolean,
             "null" => GrammarType::Null,
             "object" => compile_object(schema, max_states, depth)?,
@@ -177,15 +192,101 @@ fn compile_schema(
             limit: max_states,
         });
     }
-    // M5-③：字节级自动机超上限（required 计数器展开/键 trie 过大）→ 整体拒绝。
-    // 报错沿用 SchemaTooComplex（states 为扁平计数，limit 为用户 max_states）。
+    // M5-③：字节级自动机编译失败 → 整体拒绝。M5-⑤：透出具体原因
+    // （空区间/multipleOf 过大/状态超限），报错消息保留 SchemaTooComplex 文本。
     if grammar.automaton_rejected() {
+        if let Some(msg) = grammar.automaton_error() {
+            return Err(ZealotError::SchemaCompileError(msg.to_string()));
+        }
         return Err(ZealotError::SchemaTooComplex {
             states: grammar.state_count(),
             limit: max_states,
         });
     }
     Ok(grammar)
+}
+
+fn compile_integer(schema: &JsonValue) -> Result<GrammarType, ZealotError> {
+    // M5-⑤：minimum/maximum/exclusiveMinimum/exclusiveMaximum/multipleOf。
+    // exclusive* 优先（同时出现取更严）；draft-4 布尔形态（exclusiveMinimum: true）
+    // 使对应 inclusive 边界排他。
+    let num = |k: &str| schema.get(k).and_then(|v| v.as_i64());
+    let min = num("minimum");
+    let max = num("maximum");
+    let e_min = num("exclusiveMinimum");
+    let e_max = num("exclusiveMaximum");
+    let d4_min = schema
+        .get("exclusiveMinimum")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let d4_max = schema
+        .get("exclusiveMaximum")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let lo = match (min, e_min) {
+        (Some(m), Some(e)) => Some(m.max(e.saturating_add(1))),
+        (Some(m), None) if d4_min => Some(m.saturating_add(1)),
+        (Some(m), None) => Some(m),
+        (None, Some(e)) => Some(e.saturating_add(1)),
+        (None, None) => None,
+    };
+    let hi = match (max, e_max) {
+        (Some(m), Some(e)) => Some(m.min(e.saturating_sub(1))),
+        (Some(m), None) if d4_max => Some(m.saturating_sub(1)),
+        (Some(m), None) => Some(m),
+        (None, Some(e)) => Some(e.saturating_sub(1)),
+        (None, None) => None,
+    };
+    let multiple_of = match schema.get("multipleOf") {
+        None => None,
+        Some(v) => Some(parse_multiple_of(v)?),
+    };
+    Ok(GrammarType::Integer {
+        min: lo,
+        max: hi,
+        multiple_of,
+    })
+}
+
+/// multipleOf 解析：正整数直接采用；小数做十进制展开（≤6 位）转整数缩放。
+fn parse_multiple_of(v: &JsonValue) -> Result<MultipleOf, ZealotError> {
+    if let Some(m) = v.as_u64() {
+        if m == 0 {
+            return Err(ZealotError::SchemaCompileError(
+                "multipleOf 必须为正数".into(),
+            ));
+        }
+        return Ok(MultipleOf {
+            divisor: m,
+            scale: 1,
+        });
+    }
+    if let Some(f) = v.as_f64() {
+        if !f.is_finite() || f <= 0.0 {
+            return Err(ZealotError::SchemaCompileError(
+                "multipleOf 必须为正的有限数".into(),
+            ));
+        }
+        for k in 1..=6u32 {
+            let scaled = f * 10f64.powi(k as i32);
+            if (scaled - scaled.round()).abs() < 1e-9 {
+                let p = scaled.round() as u64;
+                if p == 0 {
+                    return Err(ZealotError::SchemaCompileError("multipleOf 过小".into()));
+                }
+                return Ok(MultipleOf {
+                    divisor: p,
+                    scale: 10u64.pow(k),
+                });
+            }
+        }
+        return Err(ZealotError::SchemaCompileError(
+            "multipleOf 小数位数过多（>6 位十进制）或不可精确表示".into(),
+        ));
+    }
+    Err(ZealotError::SchemaCompileError(
+        "multipleOf 必须为数字".into(),
+    ))
 }
 
 fn compile_string(
@@ -478,5 +579,98 @@ mod tests {
         let schema = r#"{"anyOf": [{"type": "boolean"}, {"type": "object", "properties": {"a": {"type": "boolean"}, "b": {"type": "boolean"}, "c": {"type": "boolean"}, "d": {"type": "boolean"}, "e": {"type": "boolean"}}}]}"#;
         let err = compiler.compile(schema, None).unwrap_err();
         assert!(err.to_string().contains("Schema too complex"));
+    }
+
+    // ── M5-⑤：integer 范围/整除关键字 ──────────────────────────────────────
+
+    #[test]
+    fn test_integer_keywords_parsed() {
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        // exclusive 优先：exclusiveMinimum 5 → 有效下界 6；exclusiveMaximum 20 → 19
+        let g = compiler
+            .compile(
+                r#"{"type": "integer", "minimum": 0, "exclusiveMinimum": 5, "maximum": 20, "exclusiveMaximum": 20, "multipleOf": 3}"#,
+                None,
+            )
+            .unwrap();
+        match &g.grammar_type {
+            GrammarType::Integer {
+                min,
+                max,
+                multiple_of,
+            } => {
+                assert_eq!(*min, Some(6));
+                assert_eq!(*max, Some(19));
+                let mo = multiple_of.as_ref().expect("multipleOf");
+                assert_eq!((mo.divisor, mo.scale), (3, 1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // draft-4 布尔形态：exclusiveMinimum: true → minimum 0 排他（有效下界 1）
+        let g = compiler
+            .compile(
+                r#"{"type": "integer", "minimum": 0, "exclusiveMinimum": true}"#,
+                None,
+            )
+            .unwrap();
+        match &g.grammar_type {
+            GrammarType::Integer { min, max, .. } => {
+                assert_eq!(*min, Some(1));
+                assert_eq!(*max, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // 小数 multipleOf 2.5 → (divisor 25, scale 10)
+        let g = compiler
+            .compile(r#"{"type": "integer", "multipleOf": 2.5}"#, None)
+            .unwrap();
+        match &g.grammar_type {
+            GrammarType::Integer {
+                multiple_of: Some(mo),
+                ..
+            } => assert_eq!((mo.divisor, mo.scale), (25, 10)),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_integer_invalid_keywords_error() {
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        // 空区间
+        let err = compiler
+            .compile(r#"{"type": "integer", "minimum": 10, "maximum": 5}"#, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("空区间"), "{err}");
+        // multipleOf 0
+        let err = compiler
+            .compile(r#"{"type": "integer", "multipleOf": 0}"#, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("正数"), "{err}");
+        // number + 范围关键字 → 显式报错（不静默丢弃）
+        let err = compiler
+            .compile(r#"{"type": "number", "minimum": 0}"#, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("integer"), "{err}");
+        // 不可精确小数 multipleOf
+        let err = compiler
+            .compile(r#"{"type": "integer", "multipleOf": 0.1234567}"#, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("multipleOf"), "{err}");
+    }
+
+    #[test]
+    fn test_integer_oversize_multiple_of_error() {
+        // 区间 + 大 multipleOf → 状态预算超限 → 编译错误
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        let err = compiler
+            .compile(
+                r#"{"type": "integer", "minimum": 0, "maximum": 100, "multipleOf": 10000}"#,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("过大") || err.to_string().contains("too complex"),
+            "{err}"
+        );
     }
 }

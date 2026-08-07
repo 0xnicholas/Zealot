@@ -16,7 +16,12 @@ pub enum GrammarType {
         enum_values: Option<Vec<String>>,
     },
     Number,
-    Integer,
+    /// M5-⑤：整数（含范围/整除约束；min/max 为有效闭区间，exclusive* 已在解析层折算）。
+    Integer {
+        min: Option<i64>,
+        max: Option<i64>,
+        multiple_of: Option<MultipleOf>,
+    },
     Boolean,
     Null,
     Object {
@@ -37,6 +42,14 @@ pub enum GrammarType {
     },
 }
 
+/// M5-⑤：multipleOf 约束（含小数展开）。`v` 是 divisor 的倍数 ⟺
+/// `(scale × v) % divisor == 0`（整数 multipleOf 时 scale = 1）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultipleOf {
+    pub divisor: u64,
+    pub scale: u64,
+}
+
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct ConstrainedGrammar {
@@ -44,8 +57,11 @@ pub struct ConstrainedGrammar {
 
     #[pyo3(get)]
     state_count: usize,
-    /// M5-③：字节级自动机（词表接入的真实校验核心；None = 超上限被拒）
+    /// M5-③：字节级自动机（词表接入的真实校验核心；None = 编译失败被拒）
     automaton: Option<ByteAutomaton>,
+    /// M5-⑤：自动机编译失败的具体原因（空区间/multipleOf 过大/超上限）——
+    /// compile_schema 据此透出精确错误，而非一律 SchemaTooComplex。
+    automaton_error: Option<String>,
     /// PyO3 存储路径的词表（引擎走参数传递，不占用此处）
     tokenizer: Option<Tokenizer>,
 }
@@ -53,11 +69,15 @@ pub struct ConstrainedGrammar {
 impl ConstrainedGrammar {
     pub fn new(grammar_type: GrammarType) -> Self {
         let state_count = count_states(&grammar_type);
-        let automaton = ByteAutomaton::compile(&grammar_type).ok();
+        let (automaton, automaton_error) = match ByteAutomaton::compile(&grammar_type) {
+            Ok(a) => (Some(a), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         Self {
             grammar_type,
             state_count,
             automaton,
+            automaton_error,
             tokenizer: None,
         }
     }
@@ -66,9 +86,14 @@ impl ConstrainedGrammar {
         self.state_count
     }
 
-    /// 自动机是否因超上限被拒（compile_schema 据此报 SchemaTooComplex）。
+    /// 自动机是否因编译失败被拒（compile_schema 据此报错）。
     pub fn automaton_rejected(&self) -> bool {
         self.automaton.is_none()
+    }
+
+    /// 自动机编译失败原因（None = 未失败）。
+    pub fn automaton_error(&self) -> Option<&str> {
+        self.automaton_error.as_deref()
     }
 
     /// 设置 PyO3 存储词表。
@@ -140,7 +165,7 @@ fn count_states(gt: &GrammarType) -> usize {
         GrammarType::Any
         | GrammarType::String { .. }
         | GrammarType::Number
-        | GrammarType::Integer
+        | GrammarType::Integer { .. }
         | GrammarType::Boolean
         | GrammarType::Null => 1,
         // 递归计入嵌套属性（issue #15）：嵌套结构使 max_states 防护覆盖深层 schema
@@ -407,7 +432,7 @@ impl AutoBuilder {
                     exits: vec![sx],
                 }
             }
-            GrammarType::Number | GrammarType::Integer => {
+            GrammarType::Number => {
                 // s0 符号/首数字 → s1 整数部分（`.`/`e` 出边）→ s2 小数点 → s3 小数部分；
                 // s1/s3 → s4 指数 → s5 指数数字。合法收尾：s1/s3/s5。
                 let s0 = self.new_state()?;
@@ -450,6 +475,11 @@ impl AutoBuilder {
                     exits: vec![s1, s3, s5],
                 }
             }
+            GrammarType::Integer {
+                min,
+                max,
+                multiple_of,
+            } => self.compile_integer(*min, *max, multiple_of.as_ref())?,
             GrammarType::Boolean => {
                 let (start, mut ends) = self.literal_trie(&[b"true", b"false"])?;
                 AutoOut {
@@ -676,6 +706,300 @@ impl AutoBuilder {
         }
         Ok(c)
     }
+
+    // ── M5-⑤：整数范围/整除约束 ─────────────────────────────────────────────
+    //
+    // 有界区间：十进制 digit-DP，状态 = (pos, ca, cb, rem)：
+    //   ca ∈ {LT,EQ,GT}  前缀与下界幅度 A 的数字串比较（pos ≥ la 时必为 GT）
+    //   cb ∈ {LT,EQ,GT}  前缀与上界幅度 B 的比较（超过 lb 位 → 死）
+    //   rem              multipleOf 余数：10^k×value mod divisor（scale 为小数展开）
+    // 收尾（共 k 位）：k == la → ca 非 LT（且 la == lb 时 cb 非 GT）；
+    //   la < k < lb → 任意；k == lb → cb 非 LT（且 lb > la 时自动 ≥ A）；
+    //   且 rem == 0。k < la / k > lb → 死。规范形式：无前导零（`0` 单数字）。
+    // 纯 multipleOf（无区间）：余数 DFA（任意长度）。
+    // 状态数 = (lb+1) × 9 × rem_count ≤ MAX_AUTO_STATES，超限 → 编译错误（不静默）。
+
+    fn compile_integer(
+        &mut self,
+        min: Option<i64>,
+        max: Option<i64>,
+        mo: Option<&MultipleOf>,
+    ) -> Result<AutoOut, ZealotError> {
+        let lo = min.unwrap_or(i64::MIN);
+        let hi = max.unwrap_or(i64::MAX);
+        if lo > hi {
+            return Err(ZealotError::SchemaCompileError(format!(
+                "integer 空区间：minimum {lo} > maximum {hi}"
+            )));
+        }
+        let bounded = lo != i64::MIN || hi != i64::MAX;
+        let zero_ok = lo <= 0 && hi >= 0;
+
+        let start = self.new_state()?;
+        self.boundary(start);
+        let mut exits = Vec::new();
+
+        if !bounded {
+            if let Some(mo) = mo {
+                // 纯 multipleOf：余数 DFA（含正负两侧；`0` 恒为倍数）
+                let (div, scale) = (mo.divisor, mo.scale);
+                if div > MAX_AUTO_STATES as u64 / 4 {
+                    return Err(ZealotError::SchemaCompileError(format!(
+                        "multipleOf {div} 过大（无区间余数 DFA 超上限）"
+                    )));
+                }
+                let z0 = self.new_state()?;
+                self.add_edge(start, b'0', z0);
+                self.set_final(z0);
+                let mut rems = Vec::with_capacity(div as usize);
+                for _ in 0..div {
+                    rems.push(self.new_state()?);
+                }
+                let rem0 = rems[0];
+                for d in 1..=9u8 {
+                    let r = ((d as u64 * scale) % div) as usize;
+                    self.add_edge(start, b'0' + d, rems[r]);
+                }
+                for (r, &s) in rems.iter().enumerate() {
+                    for d in 0..10u8 {
+                        let r2 = ((r as u64 * 10 + d as u64 * scale) % div) as usize;
+                        self.add_edge(s, b'0' + d, rems[r2]);
+                    }
+                    if r == 0 {
+                        self.set_final(s);
+                    }
+                }
+                // 负数侧：`-` → 首数字 1-9 → 同一余数 DFA（`-0` 非法）
+                let n0 = self.new_state()?;
+                self.add_edge(start, b'-', n0);
+                for d in 1..=9u8 {
+                    let r = ((d as u64 * scale) % div) as usize;
+                    self.add_edge(n0, b'0' + d, rems[r]);
+                }
+                exits.push(z0);
+                exits.push(rem0);
+                return Ok(AutoOut { start, exits });
+            }
+            // 无约束 integer：可选 `-` + 数字串（无小数点/指数）——旧宽松语法
+            let s1 = self.new_state()?;
+            self.add_edge(start, b'-', s1);
+            for b in b'0'..=b'9' {
+                self.add_edge(start, b, s1);
+            }
+            for b in b'0'..=b'9' {
+                self.add_stay(s1, b);
+            }
+            self.set_final(s1);
+            return Ok(AutoOut {
+                start,
+                exits: vec![s1],
+            });
+        }
+
+        // 有界区间：`0`（单数字，恒为倍数）、正数侧 [max(lo,1), hi]、负数侧 `-`+幅度
+        if zero_ok {
+            let z0 = self.new_state()?;
+            self.add_edge(start, b'0', z0);
+            self.set_final(z0);
+            exits.push(z0);
+        }
+        if hi >= 1 {
+            let a = lo.max(1) as u64;
+            let b = hi as u64;
+            exits.extend(self.compile_digit_range(start, a, b, mo)?);
+        }
+        if lo < 0 {
+            let a = if hi < 0 {
+                (hi as i128).unsigned_abs() as u64
+            } else {
+                1
+            };
+            let b = (lo as i128).unsigned_abs() as u64;
+            let n0 = self.new_state()?;
+            self.add_edge(start, b'-', n0);
+            exits.extend(self.compile_digit_range(n0, a, b, mo)?);
+        }
+        Ok(AutoOut { start, exits })
+    }
+
+    /// 正数幅度区间 [a, b]（a ≥ 1）的十进制 digit-DP；entry 直接接首数字 1-9。
+    fn compile_digit_range(
+        &mut self,
+        entry: usize,
+        a: u64,
+        b: u64,
+        mo: Option<&MultipleOf>,
+    ) -> Result<Vec<usize>, ZealotError> {
+        let a_dig = decimal_digits(a);
+        let b_dig = decimal_digits(b);
+        let la = a_dig.len();
+        let lb = b_dig.len();
+        let (div, scale) = mo.map(|m| (m.divisor, m.scale)).unwrap_or((0, 1));
+        let rem_count = div.max(1) as usize;
+        let cols = 9usize; // ca × cb
+        let rows = lb * cols * rem_count; // pos ∈ 1..=lb
+        if rows > MAX_AUTO_STATES {
+            return Err(ZealotError::SchemaCompileError(format!(
+                "multipleOf {div} 过大（区间 digit-DP 需 {rows} 状态 > 上限 {MAX_AUTO_STATES}）"
+            )));
+        }
+        // 预计算 alive（自后向前）：状态可收尾或可续接到活状态；死胡同不建不接——
+        // 否则「可到达但必死」前缀（如 [0,10] 的 "11"）导致 mask 全空 → 引擎 fallback。
+        let mut alive = vec![false; rows];
+        let idxv = |pos: usize, ca: u8, cb: u8, rem: u64| {
+            ((pos - 1) * cols + (ca as usize * 3 + cb as usize)) * rem_count + rem as usize
+        };
+        let cmp3 = |d: u8, r: u8| -> u8 {
+            if d < r {
+                0
+            } else if d == r {
+                1
+            } else {
+                2
+            }
+        };
+        let range_ok = |pos: usize, ca: u8, cb: u8| match pos {
+            k if k == la => ca != 0 && (la < lb || cb != 2),
+            k if k > la && k < lb => true,
+            k if k == lb => cb != 2 && (lb > la || ca != 0),
+            _ => false,
+        };
+        let trans = |pos: usize, ca: u8, cb: u8, d: u8| -> Option<(u8, u8)> {
+            let ca2 = if ca == 1 {
+                if pos < la {
+                    cmp3(d, a_dig[pos])
+                } else {
+                    2 // 超过 la 位 → 必 > A
+                }
+            } else {
+                ca
+            };
+            let cb2 = if cb == 1 {
+                if pos < lb {
+                    cmp3(d, b_dig[pos])
+                } else {
+                    return None; // 超过 lb 位 → 必 > B，死
+                }
+            } else {
+                cb
+            };
+            Some((ca2, cb2))
+        };
+        for ca in 0..3u8 {
+            for cb in 0..3u8 {
+                for rem in 0..rem_count {
+                    alive[idxv(lb, ca, cb, rem as u64)] =
+                        range_ok(lb, ca, cb) && (div == 0 || rem == 0);
+                }
+            }
+        }
+        for pos in (1..lb).rev() {
+            for ca in 0..3u8 {
+                for cb in 0..3u8 {
+                    for rem in 0..rem_count {
+                        let mut a = range_ok(pos, ca, cb) && (div == 0 || rem == 0);
+                        if !a {
+                            for d in 0..10u8 {
+                                if let Some((ca2, cb2)) = trans(pos, ca, cb, d) {
+                                    let rem2 = if div == 0 {
+                                        0
+                                    } else {
+                                        (rem as u64 * 10 + d as u64 * scale) % div
+                                    };
+                                    if alive[idxv(pos + 1, ca2, cb2, rem2)] {
+                                        a = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        alive[idxv(pos, ca, cb, rem as u64)] = a;
+                    }
+                }
+            }
+        }
+        // 只创建活状态（顺序建表，索引 O(1)）
+        let mut state_of = vec![usize::MAX; rows];
+        for (i, a) in alive.iter().enumerate() {
+            if *a {
+                state_of[i] = self.new_state()?;
+            }
+        }
+        // 首数字（1-9）从 entry 进 DP(1, ·)——仅活目标
+        for d in 1..=9u8 {
+            let ca = if d < a_dig[0] {
+                0
+            } else if d == a_dig[0] {
+                1
+            } else {
+                2
+            };
+            let cb = if d < b_dig[0] {
+                0
+            } else if d == b_dig[0] {
+                1
+            } else {
+                2
+            };
+            let rem = if div == 0 {
+                0
+            } else {
+                (d as u64 * scale) % div
+            };
+            let t = idxv(1, ca, cb, rem);
+            if alive[t] {
+                self.add_edge(entry, b'0' + d, state_of[t]);
+            }
+        }
+        // 转移（仅活目标）与收尾
+        let mut exit_states = Vec::new();
+        for pos in 1..=lb {
+            for ca in 0..3u8 {
+                for cb in 0..3u8 {
+                    for rem in 0..rem_count {
+                        let i = idxv(pos, ca, cb, rem as u64);
+                        if !alive[i] {
+                            continue;
+                        }
+                        let cur = state_of[i];
+                        if pos < lb {
+                            for d in 0..10u8 {
+                                if let Some((ca2, cb2)) = trans(pos, ca, cb, d) {
+                                    let rem2 = if div == 0 {
+                                        0
+                                    } else {
+                                        (rem as u64 * 10 + d as u64 * scale) % div
+                                    };
+                                    let t = idxv(pos + 1, ca2, cb2, rem2);
+                                    if alive[t] {
+                                        self.add_edge(cur, b'0' + d, state_of[t]);
+                                    }
+                                }
+                            }
+                        }
+                        if range_ok(pos, ca, cb) && (div == 0 || rem == 0) {
+                            self.set_final(cur);
+                            exit_states.push(cur);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(exit_states)
+    }
+}
+
+fn decimal_digits(mut n: u64) -> Vec<u8> {
+    if n == 0 {
+        return vec![0];
+    }
+    let mut v = Vec::new();
+    while n > 0 {
+        v.push((n % 10) as u8);
+        n /= 10;
+    }
+    v.reverse();
+    v
 }
 
 #[pymethods]
@@ -762,7 +1086,7 @@ impl ConstrainedGrammar {
                 tokens.push('E' as i32);
                 tokens
             }
-            GrammarType::Integer => {
+            GrammarType::Integer { .. } => {
                 let mut tokens: Vec<i32> = vec!['-' as i32];
                 tokens.extend(48..=57);
                 tokens
@@ -826,7 +1150,7 @@ impl ConstrainedGrammar {
                 // For 1-state grammar: if min_length is 0, string can be empty (valid at state 0)
                 *min_length == 0
             }
-            GrammarType::Number | GrammarType::Integer => {
+            GrammarType::Number | GrammarType::Integer { .. } => {
                 true // at state 0, any numeric token is valid
             }
             GrammarType::Boolean | GrammarType::Null => {
@@ -939,7 +1263,17 @@ mod tests {
     fn test_object_required_keys_must_be_traversed_before_final() {
         // issue #15：required 键全部遍历完（state >= required.len()）才可合法收尾。
         let g = object_grammar(
-            vec![("name", string_leaf()), ("age", GrammarType::Integer)],
+            vec![
+                ("name", string_leaf()),
+                (
+                    "age",
+                    GrammarType::Integer {
+                        min: None,
+                        max: None,
+                        multiple_of: None,
+                    },
+                ),
+            ],
             vec!["name"],
         );
         assert!(
@@ -973,7 +1307,17 @@ mod tests {
     fn test_object_optional_fields_may_be_omitted() {
         // 无 required：根状态即可合法收尾（空对象 {} 也是合法输出）。
         let g = object_grammar(
-            vec![("name", string_leaf()), ("age", GrammarType::Integer)],
+            vec![
+                ("name", string_leaf()),
+                (
+                    "age",
+                    GrammarType::Integer {
+                        min: None,
+                        max: None,
+                        multiple_of: None,
+                    },
+                ),
+            ],
             vec![],
         );
         assert!(g.is_valid_final(0).unwrap());
@@ -1048,11 +1392,262 @@ mod tests {
             );
         }
         for bad in [b"e3".as_slice(), b"--1", b".5"] {
-            assert!(!walk(&g, bad).0, "{} 应非法", String::from_utf8_lossy(bad));
+            assert!(
+                !walk(&g, bad).1,
+                "{} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
         }
         // 中途 token：`1.`/`1e` 可续写（`1.5`/`1e-2`），但作为完整值不合法
         assert_eq!(walk(&g, b"1."), (true, false));
         assert_eq!(walk(&g, b"1e"), (true, false));
+    }
+
+    #[test]
+    fn test_automaton_integer_unbounded() {
+        // M5-⑤：integer 与 number 分离——不接受小数点/指数
+        let g = ConstrainedGrammar::new(GrammarType::Integer {
+            min: None,
+            max: None,
+            multiple_of: None,
+        });
+        for ok in [b"0".as_slice(), b"42", b"-7", b"123456789"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "{} 应合法",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"1.5".as_slice(), b"1e3", b"e3", b"--1", b".5"] {
+            assert!(
+                !walk(&g, bad).1,
+                "{} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn test_automaton_integer_ranges() {
+        let mk = |min: Option<i64>, max: Option<i64>| {
+            ConstrainedGrammar::new(GrammarType::Integer {
+                min,
+                max,
+                multiple_of: None,
+            })
+        };
+        // [0, 10]
+        let g = mk(Some(0), Some(10));
+        for ok in [b"0".as_slice(), b"1", b"5", b"10"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "[0,10] {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"-1".as_slice(), b"11", b"00", b"007"] {
+            assert!(
+                !walk(&g, bad).1,
+                "[0,10] {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // [-10, -2]
+        let g = mk(Some(-10), Some(-2));
+        for ok in [b"-2".as_slice(), b"-10"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "[-10,-2] {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"-1".as_slice(), b"-11", b"0", b"5", b"-0"] {
+            assert!(
+                !walk(&g, bad).1,
+                "[-10,-2] {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // [-3, 5]
+        let g = mk(Some(-3), Some(5));
+        for ok in [b"-3".as_slice(), b"-2", b"0", b"3", b"5"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "[-3,5] {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"-4".as_slice(), b"6"] {
+            assert!(
+                !walk(&g, bad).1,
+                "[-3,5] {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 单边：min-only / max-only
+        let g = mk(Some(5), None);
+        for ok in [b"5".as_slice(), b"9223372036854775807"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "min5 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"4".as_slice(), b"-1", b"0"] {
+            assert!(
+                !walk(&g, bad).1,
+                "min5 {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let g = mk(None, Some(100));
+        for ok in [b"-999".as_slice(), b"0", b"100"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "max100 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        let bad = b"101";
+        assert!(
+            !walk(&g, bad).1,
+            "max100 {} 应非法收尾",
+            String::from_utf8_lossy(bad)
+        );
+        // 单值
+        let g = mk(Some(3), Some(3));
+        assert_eq!(walk(&g, b"3"), (true, true));
+        for bad in [b"2".as_slice(), b"4", b"03"] {
+            assert!(
+                !walk(&g, bad).1,
+                "[3,3] {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn test_automaton_integer_multiple_of() {
+        let mk = |min: Option<i64>, max: Option<i64>, mo: Option<(u64, u64)>| {
+            ConstrainedGrammar::new(GrammarType::Integer {
+                min,
+                max,
+                multiple_of: mo.map(|(divisor, scale)| MultipleOf { divisor, scale }),
+            })
+        };
+        // [0, 30] × 3
+        let g = mk(Some(0), Some(30), Some((3, 1)));
+        for ok in [b"0".as_slice(), b"3", b"9", b"27", b"30"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "[0,30]x3 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"4".as_slice(), b"31", b"-3"] {
+            assert!(
+                !walk(&g, bad).1,
+                "[0,30]x3 {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 无区间 × 7（正负两侧）
+        let g = mk(None, None, Some((7, 1)));
+        for ok in [b"0".as_slice(), b"7", b"14", b"-7", b"-14", b"77"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "x7 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"8".as_slice(), b"-8", b"6"] {
+            assert!(
+                !walk(&g, bad).1,
+                "x7 {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 小数 multipleOf 2.5 → (divisor 25, scale 10)：整数里即 5 的倍数
+        let g = mk(None, None, Some((25, 10)));
+        for ok in [b"5".as_slice(), b"-5", b"10", b"15", b"0"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "x2.5 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"4".as_slice(), b"6", b"-4"] {
+            assert!(
+                !walk(&g, bad).1,
+                "x2.5 {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 负区间 × 2
+        let g = mk(Some(-10), Some(-2), Some((2, 1)));
+        for ok in [b"-10".as_slice(), b"-8", b"-2", b"-4"] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "[-10,-2]x2 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"-9".as_slice(), b"-3", b"-1"] {
+            assert!(
+                !walk(&g, bad).1,
+                "[-10,-2]x2 {} 应非法收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 大数边界：max 10^18 × 1（multipleOf 恒真）
+        let g = mk(Some(0), Some(1_000_000_000_000_000_000), Some((1, 1)));
+        for ok in [
+            b"0".as_slice(),
+            b"999999999999999999",
+            b"1000000000000000000",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "big {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn test_integer_empty_range_and_oversize_rejected() {
+        // 空区间 / multipleOf 过大 → 编译错误（不静默、不产出死自动机）
+        let empty = GrammarType::Integer {
+            min: Some(10),
+            max: Some(5),
+            multiple_of: None,
+        };
+        assert!(ByteAutomaton::compile(&empty).is_err(), "空区间应报错");
+        let oversize = GrammarType::Integer {
+            min: Some(0),
+            max: Some(100),
+            multiple_of: Some(MultipleOf {
+                divisor: 10000,
+                scale: 1,
+            }),
+        };
+        assert!(
+            ByteAutomaton::compile(&oversize).is_err(),
+            "multipleOf 过大应报错"
+        );
+        let g = ConstrainedGrammar::new(empty.clone());
+        assert!(g.automaton_rejected(), "空区间 grammar 应标记拒绝");
     }
 
     #[test]

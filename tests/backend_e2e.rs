@@ -262,6 +262,74 @@ async fn http_tools_forced_call_constrained_output() {
 }
 
 #[tokio::test]
+async fn http_tools_constrained_integer_param() {
+    // M5-⑤：工具参数 integer 范围约束真实执行（mock 恒定 argmax：
+    // 最小 id 胜出 → age 取 1，"0"(7) 与 "1"(6) 中 1 更小）。
+    let (_guard, http_addr) = load_mock().await;
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "age?"}],
+            "max_tokens": 64,
+            "temperature": 0,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"age": {"type": "integer", "minimum": 0, "maximum": 1}},
+                        "required": ["age"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }"#,
+    );
+    assert_eq!(code, "200", "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse response");
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(content).expect("content is JSON");
+    assert_eq!(parsed["name"], "get_weather");
+    // 区间 [0,1]：mock 恒选最小 id → "1"(id 6) < "0"(id 7)
+    assert_eq!(parsed["arguments"]["age"], 1);
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn http_tools_conflicting_range_returns_400() {
+    // M5-⑤：工具参数空区间 → 400（不产出死 grammar）
+    let (_guard, http_addr) = load_mock().await;
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "x"}],
+            "max_tokens": 64,
+            "temperature": 0,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"x": {"type": "integer", "minimum": 10, "maximum": 5}},
+                        "required": ["x"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "f"}}
+        }"#,
+    );
+    assert_eq!(code, "400", "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse response");
+    assert!(v["error"]["message"].as_str().unwrap().contains("空区间"));
+}
+
+#[tokio::test]
 async fn http_tool_choice_unknown_tool_returns_400() {
     let (_guard, http_addr) = load_mock().await;
     let (code, body) = http_chat(
