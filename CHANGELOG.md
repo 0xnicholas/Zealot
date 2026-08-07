@@ -7,6 +7,9 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M4 收官：Block Manager `loom` 并发模拟测试（issue #7）——free list
+  分配/释放、refcount、generation 并发交错全覆盖，mutation 验证有效；
+  运行 `ZEALOT_LOOM=1 cargo test --lib loom -- --test-threads=1`
 - 项目独立化：Zealot 从 Ultralisk monorepo 拆分为独立闭源仓库
   （历史完整保留，48 commits + Runtime Interface proto 2 commits）
 - Runtime Interface proto 契约随本仓库独立维护（`proto/runtime/v1/runtime.proto`）

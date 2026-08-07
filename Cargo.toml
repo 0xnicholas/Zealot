@@ -35,6 +35,8 @@ which = "6"
 
 [dev-dependencies]
 pyo3 = { version = "0.23", features = ["auto-initialize"] }
+# M4 §12-2: Block Manager free list 并发模拟测试（loom model checker）
+loom = "0.7"
 
 [profile.release]
 lto = true

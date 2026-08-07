@@ -413,7 +413,7 @@ Zealot 测试金字塔：
 |------|------|------|---------|
 | Rust 单元测试 | `cargo test --lib` | Block Manager, Scheduler, Engine, Sampling, Tokenizer, Constrained Decode | CI（无 GPU） |
 | Property-based | `proptest` | 随机 Block Manager 操作序列、schema/JSON 往返 | CI |
-| 并发正确性 | `loom` | Block Manager Free List 多线程竞争模拟 | CI |
+| 并发正确性 | `loom` | Block Manager Free List 多线程竞争模拟。运行：`ZEALOT_LOOM=1 cargo test --lib loom -- --test-threads=1`（`build.rs` 仅对本 crate 发射 `cfg(loom)`，避免全局 `--cfg loom` 破坏 tokio 依赖） | CI |
 | Python 集成 | `pytest` | PyO3 接口一致性、错误转换、`StaleHandle` 检测 | CI（无 GPU） |
 | FFI 基准测试 | `criterion` | Block Manager 单次操作延迟、GIL 持有时间 | CI |
 | GPU 集成 | `pytest + torch` | Block Manager ↔ CUDA 交互、kernel benchmark、schema DoS 测试 | GPU 机器 |
@@ -493,7 +493,7 @@ target/wheels/
 以下约束在 M4-M5 交付前必须满足：
 
 - [ ] Block Manager 使用 `BlockHandle`（generation counter），非裸 `usize`
-- [ ] Block Manager free list 使用 `Mutex<Vec>` 启动，含测试用例（`loom` 并发模拟）
+- [x] Block Manager free list 使用 `Mutex<Vec>` 启动，含测试用例（`loom` 并发模拟）
 - [ ] `allocate()` 延迟 < 500ns（benchmark 验证）
 - [ ] `JsonSchemaCompiler::compile()` 有 `max_states` / `max_compile_ms` 防护
 - [ ] `JsonSchemaCompiler` 有 schema hash 缓存 + LRU 淘汰

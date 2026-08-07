@@ -3,6 +3,20 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ── Loom 并发模拟（M4 §12-2，issue #7）──
+    // loom model checker 要求本 crate 用 `loom::sync` 类型编译；loom 0.7
+    // 的同步原语本身就是模型实现，`cfg(loom)` 只决定用户 crate 选哪种类型。
+    // 通过环境变量触发并用 build script 的 rustc-cfg 只对本 crate 生效，
+    // 避免 RUSTFLAGS="--cfg loom" 全局生效时破坏 tokio 等依赖的编译。
+    // 运行方式：ZEALOT_LOOM=1 cargo test --lib loom -- --test-threads=1
+    println!("cargo:rerun-if-env-changed=ZEALOT_LOOM");
+    if std::env::var_os("ZEALOT_LOOM").is_some() {
+        println!("cargo:rustc-cfg=loom");
+        println!("cargo::rustc-check-cfg=cfg(loom)");
+    } else {
+        println!("cargo::rustc-check-cfg=cfg(loom)");
+    }
+
     // ── Existing proto compilation ──
     std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
     tonic_build::configure()
