@@ -7,6 +7,11 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M4 收官：docs/phase2_lifecycle.md（issue #11，§12-8）——构建 → 启动 →
+  模型加载 → gRPC/HTTP 请求 → 流式返回 → 关闭全链路文档 + 实测通过
+  （本地 tiny LLaMA，16 token 生成，SSE 6 帧）；发现并跟进 #26
+  （model_loader 仅 LLaMA 系 / CPU runner 无 GQA）；README/测试
+  的 tiny-random-gpt2 引用修正为 LLaMA 系
 - M4 收官：proptest BlockManager 随机序列测试（issue #10）——模型对照法
   （free list 栈 + refcount/generation），逐操作断言无重复分配 / stale 拒绝 /
   refcount 归零才回池 / generation 递增 + 引用守恒；mutation 验证有效

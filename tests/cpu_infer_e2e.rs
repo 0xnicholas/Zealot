@@ -1,7 +1,8 @@
 //! CPU 端到端：真实模型推理（dev-mode PyModelRunner，PyTorch CPU）。
 //!
 //! 运行条件：
-//!   ZEALOT_E2E_MODEL=<hf repo id>        如 hf-internal-testing/tiny-random-gpt2
+//!   ZEALOT_E2E_MODEL=<hf repo id>        如 hf-internal-testing/tiny-random-LlamaForCausalLM
+//!                                            （仅 LLaMA 系 MHA 架构，见 docs/phase2_lifecycle.md §6）
 //!   ZEALOT_SITE_PACKAGES=<venv>/lib/python3.12/site-packages
 //! 未设置 ZEALOT_E2E_MODEL 时跳过（CI 无模型环境）。
 

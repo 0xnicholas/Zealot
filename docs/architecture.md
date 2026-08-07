@@ -509,4 +509,4 @@ target/wheels/
 - [ ] `JsonSchemaCompiler` 有 schema hash 缓存 + LRU 淘汰
 - [x] 对抗性 schema 拒绝测试（pytest + 10000 状态 schema）
 - [ ] §8.1 的 8 个 FFI benchmark 全部在 CI 中运行
-- [ ] `phase2_lifecycle.md` 单独文档，描述 Phase 2 可运行的完整路径
+- [x] `phase2_lifecycle.md` 单独文档，描述 Phase 2 可运行的完整路径（issue #11，全链路实测通过）

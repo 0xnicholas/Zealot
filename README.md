@@ -141,13 +141,19 @@ python3.12 -m venv .venv
 # transformers ≥4.47 要求 torch≥2.4；torch 2.2 不兼容 numpy 2.x
 
 # CPU 端到端真实推理测试（未设置 ZEALOT_E2E_MODEL 则自动跳过）
-ZEALOT_E2E_MODEL=hf-internal-testing/tiny-random-gpt2 \
+# 注：model loader 仅支持 LLaMA 系架构（MHA 配置），详见 docs/phase2_lifecycle.md §6
+ZEALOT_E2E_MODEL=hf-internal-testing/tiny-random-LlamaForCausalLM \
 ZEALOT_SITE_PACKAGES="$PWD/.venv/lib/python3.12/site-packages" \
 HF_ENDPOINT=https://hf-mirror.com \
 cargo test --test cpu_infer_e2e -- --nocapture
 ```
 
 环境变量：`ZEALOT_SITE_PACKAGES` 把 venv 的 site-packages 注入嵌入 CPython；`ZEALOT_E2E_MODEL` 指定 e2e 测试模型；`HF_ENDPOINT` 在 huggingface.co 不可达时指向镜像。
+
+## Phase 2 完整运行链路
+
+见 [`docs/phase2_lifecycle.md`](docs/phase2_lifecycle.md)：构建 → 启动 zealot-backend →
+模型加载（PyO3/HF）→ gRPC / HTTP 请求 → 流式返回 → 关闭，含环境变量速查与故障排查。
 
 ## 测试策略
 
