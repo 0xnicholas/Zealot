@@ -27,7 +27,10 @@ fn http_chat_non_streaming() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let body: serde_json::Value = serde_json::from_str(&stdout).expect("parse JSON");
     assert_eq!(body["object"], "chat.completion");
-    assert!(body["choices"][0]["message"]["content"].as_str().unwrap().len() > 0);
+    assert!(!body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .is_empty());
     eprintln!("non-streaming OK: {body}");
 }
 
@@ -49,7 +52,10 @@ fn http_chat_streaming() {
     assert!(output.status.success(), "curl exit: {}", output.status);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("data: [DONE]"), "missing [DONE] terminator");
-    assert!(stdout.contains("chat.completion.chunk"), "missing SSE chunks");
+    assert!(
+        stdout.contains("chat.completion.chunk"),
+        "missing SSE chunks"
+    );
     assert!(stdout.contains("finish_reason"), "missing finish_reason");
     eprintln!("streaming OK, {} bytes", stdout.len());
 }

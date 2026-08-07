@@ -127,11 +127,11 @@ mod tests {
             head_dim: 4,
             max_seq_len: 3,
         };
-        let q = vec![1.0_f32; 1 * 2 * 3 * 4];
-        let k = vec![1.0_f32; 1 * 2 * 3 * 4];
-        let v = vec![1.0_f32; 1 * 2 * 3 * 4];
+        let q = vec![1.0_f32; 24];
+        let k = vec![1.0_f32; 24];
+        let v = vec![1.0_f32; 24];
         let out = attn.forward(&q, &k, &v, &batch).unwrap();
-        assert_eq!(out.len(), 1 * 2 * 3 * 4);
+        assert_eq!(out.len(), 24);
     }
 
     #[test]
@@ -144,8 +144,8 @@ mod tests {
             max_seq_len: 3,
         };
         let q = vec![1.0_f32; 10]; // wrong size
-        let k = vec![1.0_f32; 1 * 2 * 3 * 4];
-        let v = vec![1.0_f32; 1 * 2 * 3 * 4];
+        let k = vec![1.0_f32; 24];
+        let v = vec![1.0_f32; 24];
         let err = attn.forward(&q, &k, &v, &batch).unwrap_err();
         assert!(matches!(err, ZealotError::Internal(_)));
     }
@@ -160,10 +160,10 @@ mod tests {
             max_seq_len: 2,
         };
         // seq0 q all 1, seq1 q all 100
-        let mut q = vec![1.0_f32; 2 * 1 * 2 * 4];
-        let base1 = 1 * 1 * 2 * 4;
-        for i in base1..q.len() {
-            q[i] = 100.0;
+        let mut q = vec![1.0_f32; 16];
+        let base1 = 8;
+        for e in &mut q[base1..] {
+            *e = 100.0;
         }
         // position-dependent k/v: pos0 gets half the dot-product sum of pos1,
         // so different query magnitudes produce different softmax distributions

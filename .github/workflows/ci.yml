@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   rust:
-    name: Rust
+    name: Rust (fmt + clippy + test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,12 +29,70 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy
+      # M4 闸门（issue #13）：clippy 硬闸 —— 原 continue-on-error 移除，告警即失败
+      - name: cargo clippy (-D warnings, hard gate)
         run: cargo clippy --all-targets -- -D warnings
-        continue-on-error: true  # clippy nits shouldn't gate CI yet
 
       - name: cargo test
         run: cargo test --all-targets --no-fail-fast
         env:
           # CPU e2e 需要 venv + HF 模型，未配置时自动跳过（tests/cpu_infer_e2e.rs）
           ZEALOT_E2E_MODEL: ""
+
+  bench:
+    name: Bench (criterion §8.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      # M4 §8.1 的 8 个 FFI 微基准（block_manager 6 项 + constrained_decode 2 项）：
+      # 每次 CI 跑并报告；criterion 无阈值断言，不达标不挂 CI（结果在日志 + HTML 报告 artifact）。
+      - name: cargo bench
+        run: cargo bench --bench block_manager --bench constrained_decode
+
+      - name: Upload criterion report
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: target/criterion
+          retention-days: 14
+
+  pytest:
+    name: pytest (PyO3 extension)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pyo3 0.23 最高支持 Python 3.13，CI 固定 3.12（与 .cargo/config.toml 的
+      # PYO3_PYTHON=python3.12 一致）
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Install maturin & pytest
+        run: pip install maturin pytest
+
+      - name: Build extension wheel & install
+        run: |
+          maturin build --release --interpreter python3.12
+          pip install target/wheels/zealot*.whl
+
+      - name: pytest
+        run: pytest tests/ -q

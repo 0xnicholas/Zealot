@@ -16,23 +16,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::http::StatusCode;
 use axum::{
     extract::State,
-    response::{sse::{Event, Sse}, IntoResponse},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse,
+    },
     routing::post,
     Json, Router,
 };
-use axum::http::StatusCode;
 use futures::StreamExt;
 use tokio_stream::{wrappers::ReceiverStream, wrappers::TcpListenerStream, Stream};
 use tonic::{transport::Server, Request, Status, Streaming};
 
+#[cfg(feature = "cuda")]
+use zealot_engine::cuda_runner::CudaModelRunner;
 use zealot_engine::engine::{Engine, ModelRunner};
 use zealot_engine::error::ZealotError;
 use zealot_engine::model_runner_cpu::CpuModelRunner;
 use zealot_engine::openai::{self, ChatCompletionRequest};
-#[cfg(feature = "cuda")]
-use zealot_engine::cuda_runner::CudaModelRunner;
 use zealot_engine::sampling::SamplingParams;
 use zealot_engine::scheduler::{Priority, Scheduler, SchedulerConfig};
 use zealot_engine::tokenizer::Tokenizer;
@@ -76,16 +79,12 @@ struct SlotHandle {
     model: LoadedModel,
 }
 
+#[derive(Default)]
 enum ModelSlot {
+    #[default]
     Empty,
     Loading,
     Ready(SlotHandle),
-}
-
-impl Default for ModelSlot {
-    fn default() -> Self {
-        ModelSlot::Empty
-    }
 }
 
 fn usage_frame(request_id: &str, prompt: usize, completion: usize, reason: &str) -> InferResponse {
@@ -224,6 +223,9 @@ struct Runtime {
 }
 
 impl Runtime {
+    // tonic::Status 含动态 details 字段，Err 变体 >128B；poison 分支极少触发，
+    // 保持 Result<_, Status> 签名以便 10 处 `?` 直传，scoped allow 明确记录此权衡。
+    #[allow(clippy::result_large_err)]
     fn lock_slot(&self) -> Result<std::sync::MutexGuard<'_, ModelSlot>, Status> {
         self.slot
             .lock()
@@ -293,18 +295,20 @@ impl InferenceRuntime for Runtime {
 
         let model_id = req.model_id.clone();
         // 加载是重阻塞操作（HF 下载 + CPU 读盘），移出 tokio 工作线程
-        let runner: Box<dyn ModelRunner> = match tokio::task::spawn_blocking(move || -> Result<Box<dyn ModelRunner>, ZealotError> {
-            #[cfg(feature = "cuda")]
-            {
-                match CudaModelRunner::load(&model_id, 0) {
-                    Ok(r) => return Ok(Box::new(r)),
-                    Err(e) => {
-                        tracing::warn!("GPU runner unavailable, falling back to CPU: {e}");
+        let runner: Box<dyn ModelRunner> = match tokio::task::spawn_blocking(
+            move || -> Result<Box<dyn ModelRunner>, ZealotError> {
+                #[cfg(feature = "cuda")]
+                {
+                    match CudaModelRunner::load(&model_id, 0) {
+                        Ok(r) => return Ok(Box::new(r)),
+                        Err(e) => {
+                            tracing::warn!("GPU runner unavailable, falling back to CPU: {e}");
+                        }
                     }
                 }
-            }
-            Ok(Box::new(CpuModelRunner::load(&model_id)?))
-        })
+                Ok(Box::new(CpuModelRunner::load(&model_id)?))
+            },
+        )
         .await
         {
             Ok(Ok(r)) => r,
@@ -551,9 +555,7 @@ impl InferenceRuntime for Runtime {
 
 // ── OpenAI HTTP handler ─────────────────────────────
 
-async fn health_check(
-    State(backend): State<Runtime>,
-) -> Json<serde_json::Value> {
+async fn health_check(State(backend): State<Runtime>) -> Json<serde_json::Value> {
     let status = match backend.slot.lock() {
         Ok(slot) => match &*slot {
             ModelSlot::Ready(h) => serde_json::json!({
@@ -584,21 +586,40 @@ async fn handle_openai_chat(
     let (model_id, cmd_tx) = {
         let slot = match backend.slot.lock() {
             Ok(s) => s,
-            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine slot lock poisoned"}))).into_response(),
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "engine slot lock poisoned"})),
+                )
+                    .into_response()
+            }
         };
         match &*slot {
             ModelSlot::Ready(h) => (h.model.model_id.clone(), h.cmd_tx.clone()),
-            _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "no model loaded"}))).into_response(),
+            _ => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "no model loaded"})),
+                )
+                    .into_response()
+            }
         }
     };
 
-    let request_id = format!("chatcmpl-{}", REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let request_id = format!(
+        "chatcmpl-{}",
+        REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let messages: Vec<(String, String)> = body.messages.into_iter().map(|m| (m.role, m.content)).collect();
+    let messages: Vec<(String, String)> = body
+        .messages
+        .into_iter()
+        .map(|m| (m.role, m.content))
+        .collect();
     let max_tokens = body.max_tokens.unwrap_or(32).min(512) as usize;
 
     let sampling_params = zealot_engine::sampling::SamplingParams {
@@ -612,21 +633,30 @@ async fn handle_openai_chat(
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel(64);
-    if cmd_tx.send(EngineCmd::Infer {
-        request_id: request_id.clone(),
-        messages,
-        max_tokens,
-        priority: Priority::Medium,
-        sampling_params,
-        tx,
-    }).is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine thread gone"}))).into_response();
+    if cmd_tx
+        .send(EngineCmd::Infer {
+            request_id: request_id.clone(),
+            messages,
+            max_tokens,
+            priority: Priority::Medium,
+            sampling_params,
+            tx,
+        })
+        .is_err()
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "engine thread gone"})),
+        )
+            .into_response();
     }
 
     if body.stream {
         streaming_response(rx, &request_id, &model_id, ts).into_response()
     } else {
-        non_streaming_response(rx, &request_id, &model_id, ts).await.into_response()
+        non_streaming_response(rx, &request_id, &model_id, ts)
+            .await
+            .into_response()
     }
 }
 
@@ -640,22 +670,30 @@ fn streaming_response(
     let mdl = model.to_owned();
     let stream = ReceiverStream::new(rx).flat_map(move |frame| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
-        match frame {
-            Ok(resp) => match resp.payload {
+        if let Ok(resp) = frame {
+            match resp.payload {
                 Some(Payload::Delta(d)) => {
-                    let json = serde_json::to_string(&openai::sse_content(&rid, &mdl, ts, &d.text)).unwrap_or_default();
+                    let json = serde_json::to_string(&openai::sse_content(&rid, &mdl, ts, &d.text))
+                        .unwrap_or_default();
                     events.push(Ok(Event::default().data(json)));
                 }
                 Some(Payload::Final(f)) => {
                     let pt = f.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0);
                     let ct = f.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
-                    let json = serde_json::to_string(&openai::sse_finish(&rid, &mdl, ts, &f.finish_reason, pt, ct)).unwrap_or_default();
+                    let json = serde_json::to_string(&openai::sse_finish(
+                        &rid,
+                        &mdl,
+                        ts,
+                        &f.finish_reason,
+                        pt,
+                        ct,
+                    ))
+                    .unwrap_or_default();
                     events.push(Ok(Event::default().data(json)));
                     events.push(Ok(Event::default().data("[DONE]")));
                 }
                 None => {}
-            },
-            Err(_) => {}
+            }
         }
         futures::stream::iter(events)
     });
@@ -692,8 +730,13 @@ async fn non_streaming_response(
     }
 
     let json = openai::non_streaming_response(
-        request_id, model, ts, content, finish_reason,
-        prompt_tokens, completion_tokens,
+        request_id,
+        model,
+        ts,
+        content,
+        finish_reason,
+        prompt_tokens,
+        completion_tokens,
     );
     let value: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
     Json(value)

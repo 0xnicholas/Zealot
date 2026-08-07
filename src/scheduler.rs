@@ -11,18 +11,13 @@ use crate::error::ZealotError;
 use crate::sampling::SamplingParams;
 
 /// 调度优先级，与 proto `runtime.v1.Priority` 一一对应（bin 层做转换）。
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub enum Priority {
     Lowest = 0,
+    #[default]
     Medium = 1,
     High = 2,
     Highest = 3,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Medium
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -108,6 +103,10 @@ impl Sequence {
         } else {
             self.prompt_tokens.len() + self.output_tokens.len()
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// 本步喂给 runner 的输入：prefill 为全部 token，decode 为上一步 token。
