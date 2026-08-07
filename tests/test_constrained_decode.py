@@ -132,6 +132,38 @@ def test_invalid_json_rejected():
         c.compile("this is not json")
 
 
+def test_vocab_mode_real_token_ids(tmp_path):
+    """M5-③：load_tokenizer 后 allowed_tokens/advance 切换为真实词表 ID。"""
+    vocab = {"{": 0, "}": 1, '"': 2, ":": 3, ",": 4, "name": 5, "true": 6}
+    tok_path = tmp_path / "tokenizer.json"
+    tok_path.write_text(json.dumps({"model": {"type": "BPE", "vocab": vocab}}))
+
+    c = make_compiler()
+    schema = {"type": "object", "properties": {"name": {"type": "boolean"}}, "required": ["name"]}
+    g = c.compile(json.dumps(schema))
+    g.load_tokenizer(str(tok_path))
+
+    # state 0：required 未满足 → 只有 `{`(0) 合法（`}` 被自动机拒绝）
+    assert g.allowed_tokens(0) == [0]
+    s = g.advance(0, 0)  # `{`
+    assert not g.is_valid_final(s)
+    # 完整对象：{ " name " : true }
+    for t in [2, 5, 2, 3, 6]:
+        s = g.advance(s, t)
+    # required 已满足：`,` 与 `}` 均合法，但 `{` 不合法
+    assert g.allowed_tokens(s) == [1, 4]
+    s = g.advance(s, 1)  # `}`
+    assert g.is_valid_final(s)
+
+
+def test_vocab_mode_legacy_without_tokenizer():
+    """M5-③：未加载词表时保持 Phase-2 占位语义（向后兼容）。"""
+    c = make_compiler()
+    g = c.compile(json.dumps(SIMPLE))
+    tokens = g.allowed_tokens(0)
+    assert isinstance(tokens, list) and all(isinstance(t, int) for t in tokens)
+
+
 def test_invalid_state_out_of_range():
     c = make_compiler()
     g = c.compile(json.dumps(SIMPLE))

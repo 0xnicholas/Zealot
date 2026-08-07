@@ -40,6 +40,7 @@ struct AddedToken {
 
 /// A lightweight token ID → text decoder backed by a HuggingFace
 /// `tokenizer.json` vocabulary.
+#[derive(Clone, Debug)]
 pub struct Tokenizer {
     /// id → token string
     id_to_token: Vec<Option<String>>,
@@ -182,6 +183,32 @@ impl Tokenizer {
     /// Number of tokens in the vocabulary.
     pub fn vocab_size(&self) -> usize {
         self.id_to_token.len()
+    }
+
+    /// 测试/嵌入式构造：直接给定词表（id → token 字符串）。
+    #[doc(hidden)]
+    pub fn from_vocab(id_to_token: Vec<Option<String>>, is_byte_level: bool) -> Self {
+        Self {
+            id_to_token,
+            is_byte_level,
+        }
+    }
+
+    /// 返回 token 的原始字节表示（M5-③ matcher 词表接入用）。
+    /// byte-level BPE：token 字符串按字节解码；word-level：字符串 UTF-8 字节。
+    pub fn token_bytes(&self, token_id: i64) -> Option<Vec<u8>> {
+        if token_id < 0 {
+            return None;
+        }
+        let token_str = self
+            .id_to_token
+            .get(token_id as usize)
+            .and_then(|o| o.as_ref())?;
+        Some(if self.is_byte_level {
+            byte_level_decode(token_str)
+        } else {
+            token_str.as_bytes().to_vec()
+        })
     }
 }
 

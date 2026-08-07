@@ -162,8 +162,9 @@ impl Engine {
                     rand::rngs::StdRng::seed_from_u64(seed)
                 };
                 // M5-②：约束解码钩子——采样前按 grammar 当前状态构建 allowed-token mask。
+                // M5-③：engine 词表接入——有 tokenizer 时 mask 为真实词表 ID。
                 let mask = seq.grammar.as_ref().map(|g| {
-                    let allowed = g.allowed_tokens_for(seq.grammar_state);
+                    let allowed = g.allowed_tokens_for(seq.grammar_state, self.tokenizer.as_ref());
                     let mut m = vec![false; logits.len()];
                     for &t in &allowed {
                         if t >= 0 && (t as usize) < m.len() {
@@ -175,7 +176,7 @@ impl Engine {
                     if let Some(eos) = seq.eos_token_id {
                         if eos >= 0
                             && (eos as usize) < m.len()
-                            && !g.is_valid_final_state(seq.grammar_state)
+                            && !g.is_valid_final_state(seq.grammar_state, self.tokenizer.as_ref())
                         {
                             m[eos as usize] = false;
                         }
@@ -226,7 +227,8 @@ impl Engine {
                 seq.output_tokens.push(token);
                 // grammar 状态仅在输出 token 落盘时推进（prefill 中间 chunk 不推进）
                 if let Some(g) = &seq.grammar {
-                    seq.grammar_state = g.advance_state(seq.grammar_state, token);
+                    seq.grammar_state =
+                        g.advance_state(seq.grammar_state, token, self.tokenizer.as_ref());
                 }
                 let text = step_out
                     .text
@@ -245,10 +247,9 @@ impl Engine {
                 if seq.eos_token_id.is_some()
                     && seq.output_tokens.last() == seq.eos_token_id.as_ref()
                     // M5-②：grammar 未达合法收尾时即使 EOS 落盘也强制续写
-                    && seq
-                        .grammar
-                        .as_ref()
-                        .is_none_or(|g| g.is_valid_final_state(seq.grammar_state))
+                    && seq.grammar.as_ref().is_none_or(|g| {
+                        g.is_valid_final_state(seq.grammar_state, self.tokenizer.as_ref())
+                    })
                 {
                     Some((seq.request_id.clone(), FinishReason::Stop))
                 } else if seq.output_tokens.len() >= seq.max_tokens {
@@ -597,5 +598,69 @@ mod tests {
             tokens.extend(res.tokens.iter().map(|t| t.token));
         }
         assert_eq!(tokens, vec![7, 7], "fallback 未约束采样应取 argmax");
+    }
+
+    // ── M5-③：词表接入的端到端集成（真实 token 校验 + mask 钩子）──────────
+
+    #[test]
+    fn grammar_vocab_mode_integrated_with_mask_hook() {
+        // byte-level 词表：{=0, }=1, "=2, :=3, ,=4, name=5, true=6
+        let tok = crate::tokenizer::Tokenizer::from_vocab(
+            vec![
+                Some("{".into()),
+                Some("}".into()),
+                Some("\"".into()),
+                Some(":".into()),
+                Some(",".into()),
+                Some("name".into()),
+                Some("true".into()),
+            ],
+            true,
+        );
+        let mut props = std::collections::HashMap::new();
+        props.insert("name".to_string(), GrammarType::Boolean);
+        let grammar = ConstrainedGrammar::new(GrammarType::Object {
+            properties: props,
+            required: vec!["name".to_string()],
+            additional_properties: false,
+        });
+        // 每步 logits 都强偏好 `}`(1)——未达收尾状态时被真实自动机 mask 屏蔽。
+        // 7 步 = 6 个 JSON token + 收尾 `}`
+        let logits = biased_logits(7, 1, 7);
+        let sched = Scheduler::new(SchedulerConfig::default()).unwrap();
+        let mut engine = Engine::new(sched, Box::new(LogitRunner { logits })).with_tokenizer(tok);
+        let seq = engine
+            .scheduler_mut()
+            .make_sequence(
+                "g4".into(),
+                vec![1, 2],
+                8,
+                Priority::Medium,
+                Some(1), // eos = `}`
+                SamplingParams {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .with_grammar(grammar);
+        engine.scheduler_mut().add(seq);
+
+        let mut tokens = Vec::new();
+        let mut finished = Vec::new();
+        while !engine.is_idle() {
+            let res = engine.step().unwrap();
+            for t in &res.tokens {
+                tokens.push(t.token);
+            }
+            finished.extend(
+                res.finished
+                    .iter()
+                    .map(|f| (f.request_id.clone(), f.reason)),
+            );
+        }
+        // { " name " : true } —— `}` 被屏蔽直到全部 required 满足
+        assert_eq!(tokens, vec![0, 2, 5, 2, 3, 6, 1]);
+        assert_eq!(finished, vec![("g4".to_string(), FinishReason::Stop)]);
     }
 }

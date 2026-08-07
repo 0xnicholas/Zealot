@@ -7,6 +7,14 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-③：matcher 真实 token 级校验（issue #17）——GrammarType 编译为字节级
+  自动机（stay 位集 + 边表 + final 标记，start 恒为 0）；`allowed_tokens` 按真实
+  词表（Tokenizer::token_bytes）过滤、`advance` 按 token 字节真实映射状态；
+  required 用计数器状态 k 表达（须按 required 数组顺序，`}` 只在 k==r 可达）、
+  数组 min/max 计数器、键 trie、union 分支派发、token 间空白（byte-level `Ġ`
+  前缀 token）；引擎 mask 钩子接入词表（有 tokenizer 即真实校验，无则 Phase-2
+  占位）；自动机超上限（262144 状态）拒绝；PyO3 `load_tokenizer`；性能优化
+  （DFA 压缩/状态缓存）留 Phase 3
 - M5-②：约束解码参与真实 decode 路径（issue #16）——Sequence 携带 grammar
   状态字段；`Engine::step` 采样前应用 allowed-token mask（`Sampler::sample_with_mask`，
   mask 硬过滤优先于贪心/温度/top-k/p/penalty）；全屏蔽 fallback 为未约束采样

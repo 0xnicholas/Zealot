@@ -158,6 +158,15 @@ fn compile_schema(
         }
         .into());
     }
+    // M5-③：字节级自动机超上限（required 计数器展开/键 trie 过大）→ 整体拒绝。
+    // 报错沿用 SchemaTooComplex（states 为扁平计数，limit 为用户 max_states）。
+    if grammar.automaton_rejected() {
+        return Err(ZealotError::SchemaTooComplex {
+            states: grammar.state_count(),
+            limit: max_states,
+        }
+        .into());
+    }
     Ok(grammar)
 }
 
