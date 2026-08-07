@@ -4,7 +4,7 @@
 //!   ZEALOT_E2E_MODEL=<hf repo id>        如 hf-internal-testing/tiny-random-LlamaForCausalLM
 //!                                            （仅 LLaMA 系 MHA 架构，见 docs/phase2_lifecycle.md §6）
 //!   ZEALOT_SITE_PACKAGES=<venv>/lib/python3.12/site-packages
-//! 未设置 ZEALOT_E2E_MODEL 时跳过（CI 无模型环境）。
+//! 未设置或为空（CI 无模型环境，设 `ZEALOT_E2E_MODEL: ""`）时跳过。
 
 mod common;
 
@@ -23,6 +23,11 @@ async fn cpu_end_to_end_infer() {
         eprintln!("skip: ZEALOT_E2E_MODEL not set");
         return;
     };
+    if model.is_empty() {
+        // CI 以 `ZEALOT_E2E_MODEL: ""` 显式关闭 e2e：空值同样跳过（issue #13）
+        eprintln!("skip: ZEALOT_E2E_MODEL empty");
+        return;
+    }
 
     let (_guard, addr) = spawn_backend().await;
     let mut client = InferenceRuntimeClient::connect(format!("http://{addr}"))
