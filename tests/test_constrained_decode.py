@@ -312,3 +312,46 @@ def test_string_length_invalid_ranges_rejected():
         c.compile(json.dumps({"type": "string", "minLength": 5, "maxLength": 2}))
     with pytest.raises(RuntimeError, match="过大"):
         c.compile(json.dumps({"type": "string", "maxLength": 99999999}))
+
+
+def test_string_format_subset(tmp_path):
+    """M5-⑦：format 子集编译 + 真实词表 walk 正反例。"""
+    vocab = {chr(i): i for i in range(256)}
+    tok_path = tmp_path / "tokenizer.json"
+    tok_path.write_text(json.dumps({"model": {"type": "BPE", "vocab": vocab}}))
+    c = make_compiler()
+
+    def walk_ok(gs, text):
+        st = 0
+        for b in text.encode("utf-8"):
+            if b not in gs.allowed_tokens(st):
+                return False
+            st = gs.advance(st, b)
+        return gs.is_valid_final(st)
+
+    cases = [
+        ("email", ['"a@b.c"', '"user.name+tag@x-y.com"'], ['"a@"', '"@b.c"', '"a b@c"']),
+        ("date", ['"2024-02-29"', '"9999-12-31"'], ['"2024-13-01"', '"2024-01-32"', '"24-01-01"']),
+        ("date-time", ['"2024-01-01T00:00:00Z"', '"2024-01-01t23:59:59+08:00"'], ['"2024-01-01"', '"2024-01-01 00:00:00Z"']),
+        ("time", ['"00:00:00"', '"23:59:59.5Z"'], ['"24:00:00"', '"12:00"']),
+        ("uuid", ['"123e4567-e89b-12d3-a456-426614174000"'], ['"123e4567-e89b-12d3-a456-42661417400g"', '"123"']),
+        ("ipv4", ['"192.168.1.1"', '"255.255.255.255"'], ['"256.0.0.1"', '"01.2.3.4"', '"1.2.3"']),
+        ("ipv6", ['"::1"', '"2001:db8::1"', '"1:2:3:4:5:6:7:8"'], ['"1:2:3"', '"1::2::3"', '"g::1"']),
+        ("hostname", ['"localhost"', '"example.com"', '"sub-a.b.co.uk"'], ['"-a.com"', '"a..b"', '"a."']),
+        ("uri", ['"https://example.com/p?q=1#f"', '"mailto:u@x.com"'], ['"1http://x"', '"a b:c"']),
+    ]
+    for fmt, ok_list, bad_list in cases:
+        g = c.compile(json.dumps({"type": "string", "format": fmt}))
+        g.load_tokenizer(str(tok_path))
+        for t in ok_list:
+            assert walk_ok(g, t), f"{fmt} 应接受 {t}"
+        for t in bad_list:
+            assert not walk_ok(g, t), f"{fmt} 应拒绝 {t}"
+
+
+def test_string_format_unsupported_errors():
+    """M5-⑦：不支持的 format → 显式报错（P2 语义）。"""
+    c = make_compiler()
+    for fmt in ["binary", "byte", "password", "int32"]:
+        with pytest.raises(RuntimeError, match="暂不支持"):
+            c.compile(json.dumps({"type": "string", "format": fmt}))

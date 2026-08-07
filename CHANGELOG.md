@@ -7,6 +7,14 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-⑦：string format 子集（issue #21）——email（local 点不可首尾/连续 +
+  域名 label）、date（YYYY-MM-DD，月 01-12 日 01-31 结构校验）、date-time
+  （date T time，T/t 分隔，裸日期不可收尾）、time（HH:MM:SS(.f+)?(Z|[+-]HH:MM)?）、
+  uuid（8-4-4-4-12 hex）、ipv4（四段 0-255 无前导零）、ipv6（8 组 hex +
+  至多一个 `::` 压缩，RFC 4291 结构，不含内嵌 IPv4）、hostname（点分 label
+  字母数字首尾）、uri（scheme:非空白/控制字节宽松子集）；与 minLength/maxLength
+  乘积组合（状态预算超限显式报错）；不支持 format → 显式编译错误（P2 语义，
+  不静默降级）；format 内容不允许转义（`\`/`"` 不在字符集中）
 - M5-⑥：string minLength/maxLength 执行（issue #20）——长度计数自动机：
   content_k/esc_k/u1..u4_k（k = 已消费码点数）；码点计数（ASCII/首字节 +1、
   UTF-8 连续字节不计、`\x` 转义 +1、`\uXXXX` +1 且严格 hex 链，代理对按 2 计

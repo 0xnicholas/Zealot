@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::matcher::{ConstrainedGrammar, GrammarType, MultipleOf};
+use super::matcher::{ConstrainedGrammar, GrammarType, MultipleOf, StringFormat};
 use crate::error::ZealotError;
 
 const MAX_NESTING_DEPTH: usize = 32;
@@ -303,6 +303,24 @@ fn compile_string(
         .get("pattern")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let format = match schema.get("format").and_then(|v| v.as_str()) {
+        None => None,
+        // M5-⑦：format 常用子集；未列出 → 显式报错（P2 语义，不静默降级）
+        Some("email") => Some(StringFormat::Email),
+        Some("date") => Some(StringFormat::Date),
+        Some("date-time") => Some(StringFormat::DateTime),
+        Some("time") => Some(StringFormat::Time),
+        Some("uuid") => Some(StringFormat::Uuid),
+        Some("ipv4") => Some(StringFormat::Ipv4),
+        Some("ipv6") => Some(StringFormat::Ipv6),
+        Some("hostname") => Some(StringFormat::Hostname),
+        Some("uri") => Some(StringFormat::Uri),
+        Some(other) => {
+            return Err(ZealotError::SchemaCompileError(format!(
+                "format {other} 暂不支持（支持: email/date/date-time/time/uuid/ipv4/ipv6/hostname/uri）"
+            )));
+        }
+    };
     let enumerated = schema.get("enum").map(|v| {
         v.as_array()
             .map(|a| {
@@ -318,6 +336,7 @@ fn compile_string(
         max_length: max_len,
         pattern,
         enum_values: enumerated,
+        format,
     })
 }
 
@@ -686,6 +705,35 @@ mod tests {
             .unwrap();
         assert!(matches!(g.grammar_type, GrammarType::String { .. }));
         assert!(!g.automaton_rejected());
+    }
+
+    #[test]
+    fn test_string_format_parsed_and_unsupported_errors() {
+        // M5-⑦：format 子集解析
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        for f in [
+            "email",
+            "date",
+            "date-time",
+            "time",
+            "uuid",
+            "ipv4",
+            "ipv6",
+            "hostname",
+            "uri",
+        ] {
+            let g = compiler
+                .compile(&format!(r#"{{"type": "string", "format": "{f}"}}"#), None)
+                .unwrap_or_else(|e| panic!("format {f} 应支持: {e}"));
+            assert!(!g.automaton_rejected(), "format {f} 自动机应可编译");
+        }
+        // 不支持的 format → 显式报错（P2 语义，不静默降级）
+        for f in ["binary", "byte", "password", "date-time-extra"] {
+            let err = compiler
+                .compile(&format!(r#"{{"type": "string", "format": "{f}"}}"#), None)
+                .unwrap_err();
+            assert!(err.to_string().contains("暂不支持"), "{f}: {err}");
+        }
     }
 
     #[test]

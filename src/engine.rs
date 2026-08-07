@@ -520,6 +520,7 @@ mod tests {
                 max_length: None,
                 pattern: None,
                 enum_values: None,
+                format: None,
             },
         );
         let grammar = ConstrainedGrammar::new(GrammarType::Object {

@@ -14,6 +14,8 @@ pub enum GrammarType {
         max_length: Option<u64>,
         pattern: Option<String>,
         enum_values: Option<Vec<String>>,
+        /// M5-⑦：format 子集（内容字节级约束；None = 自由字符串）。
+        format: Option<StringFormat>,
     },
     Number,
     /// M5-⑤：整数（含范围/整除约束；min/max 为有效闭区间，exclusive* 已在解析层折算）。
@@ -40,6 +42,20 @@ pub enum GrammarType {
     Union {
         branches: Vec<GrammarType>,
     },
+}
+
+/// M5-⑦：string format 常用子集（字节级约束）。未列出的 format → 编译错误（P2 语义）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum StringFormat {
+    Email,
+    Date,
+    DateTime,
+    Time,
+    Uuid,
+    Ipv4,
+    Ipv6,
+    Hostname,
+    Uri,
 }
 
 /// M5-⑤：multipleOf 约束（含小数展开）。`v` 是 divisor 的倍数 ⟺
@@ -415,125 +431,131 @@ impl AutoBuilder {
             GrammarType::String {
                 min_length,
                 max_length,
+                format,
                 ..
             } => {
-                // M5-⑥：minLength/maxLength 真正执行。
-                // 无约束（min=0 且无 max）→ 紧凑形态（旧行为，长度不计数）。
-                // 有约束 → 计数自动机：content_k / esc_k / u1..u4_k（k = 已消费码点数）。
-                // 码点计数：ASCII/首字节（<0x80 或 ≥0xC0）= 1，UTF-8 连续字节 = 0；
-                // `\x`（非 u）转义 = 1，`\uXXXX` = 1（代理对按 2 计，文档化偏差）；
-                // min 门控收尾 `"`（k ≥ min），max 封顶（k == max 仅可收尾）；
-                // 仅 min 时 k == min 冻结为吸收态（不再计数）。
-                let min = *min_length;
-                let max = *max_length;
-                if min == 0 && max.is_none() {
-                    let s0 = self.new_state()?;
-                    let s1 = self.new_state()?;
-                    let esc = self.new_state()?;
-                    let sx = self.new_state()?;
-                    self.add_edge(s0, b'"', s1);
-                    for b in 0..=255u8 {
-                        if b != b'"' && b != b'\\' {
-                            self.add_stay(s1, b);
-                        }
-                    }
-                    self.add_edge(s1, b'"', sx);
-                    self.add_edge(s1, b'\\', esc);
-                    // esc 是全新状态：整块构建 256 条边（逐条 insert 会 O(n²) 拖慢大 schema）
-                    self.states[esc].edges = (0..=255u8).map(|b| (b, s1)).collect();
-                    self.set_final(sx);
-                    AutoOut {
-                        start: s0,
-                        exits: vec![sx],
-                    }
+                if let Some(f) = format {
+                    // M5-⑦：format 内容约束（与长度组合见 compile_format_string）
+                    self.compile_format_string(*min_length, *max_length, f)?
                 } else {
-                    let max = max.unwrap_or(min as u64);
-                    if max < min as u64 {
-                        return Err(ZealotError::SchemaCompileError(format!(
-                            "string 空区间：minLength {min} > maxLength {max}"
-                        )));
-                    }
-                    let horizon = max as usize;
-                    if horizon > MAX_LENGTH_COUNTER {
-                        return Err(ZealotError::SchemaCompileError(format!(
-                            "minLength/maxLength {horizon} 过大（上限 {MAX_LENGTH_COUNTER}）"
-                        )));
-                    }
-                    let free = max_length.is_none(); // 仅 min：k == min 后冻结（吸收态）
-                                                     // 预建 content/esc/u 状态（k = 0..=horizon），再建入口 s0
-                    let mut content: Vec<usize> = Vec::with_capacity(horizon + 1);
-                    let mut esc: Vec<usize> = Vec::with_capacity(horizon + 1);
-                    let mut u1: Vec<usize> = Vec::with_capacity(horizon + 1);
-                    let mut u2: Vec<usize> = Vec::with_capacity(horizon + 1);
-                    let mut u3: Vec<usize> = Vec::with_capacity(horizon + 1);
-                    let mut u4: Vec<usize> = Vec::with_capacity(horizon + 1);
-                    for _ in 0..=horizon {
-                        content.push(self.new_state()?);
-                        esc.push(self.new_state()?);
-                        u1.push(self.new_state()?);
-                        u2.push(self.new_state()?);
-                        u3.push(self.new_state()?);
-                        u4.push(self.new_state()?);
-                    }
-                    let s0 = self.new_state()?;
-                    let sx = self.new_state()?;
-                    self.add_edge(s0, b'"', content[0]);
-                    self.set_final(sx);
-                    for k in 0..=horizon {
-                        let cur = content[k];
-                        let absorbing = free && k == horizon;
-                        // 内容边整块构建（按字节序自然有序；O(n²) 逐条 insert 拖慢大 horizon）
-                        let mut edges: Vec<(u8, usize)> = Vec::with_capacity(256);
+                    // M5-⑥：minLength/maxLength 真正执行。
+                    // 无约束（min=0 且无 max）→ 紧凑形态（旧行为，长度不计数）。
+                    // 有约束 → 计数自动机：content_k / esc_k / u1..u4_k（k = 已消费码点数）。
+                    // 码点计数：ASCII/首字节（<0x80 或 ≥0xC0）= 1，UTF-8 连续字节 = 0；
+                    // `\x`（非 u）转义 = 1，`\uXXXX` = 1（代理对按 2 计，文档化偏差）；
+                    // min 门控收尾 `"`（k ≥ min），max 封顶（k == max 仅可收尾）；
+                    // 仅 min 时 k == min 冻结为吸收态（不再计数）。
+                    let min = *min_length;
+                    let max = *max_length;
+                    if min == 0 && max.is_none() {
+                        let s0 = self.new_state()?;
+                        let s1 = self.new_state()?;
+                        let esc = self.new_state()?;
+                        let sx = self.new_state()?;
+                        self.add_edge(s0, b'"', s1);
                         for b in 0..=255u8 {
-                            if b == b'"' {
-                                // min 门控收尾
-                                if k >= min {
-                                    edges.push((b, sx));
-                                }
-                            } else if b == b'\\' {
-                                // 转义：仅当可回落到活目标时接线（max 封顶处不可再转义）
-                                if absorbing || k < horizon {
-                                    edges.push((b, esc[k]));
-                                }
-                            } else if !(0x80..0xC0).contains(&b) {
-                                // 码点首字节：+1；吸收态停留
-                                if absorbing {
-                                    self.add_stay(cur, b);
-                                } else if k < horizon {
-                                    edges.push((b, content[k + 1]));
-                                }
-                            } else {
-                                // UTF-8 连续字节：不计数（停留）
-                                self.add_stay(cur, b);
+                            if b != b'"' && b != b'\\' {
+                                self.add_stay(s1, b);
                             }
                         }
-                        self.states[cur].edges = edges;
-                        // 转义结构：`\x`（非 u）→ +1；`\uXXXX` → +1（hex 链）
-                        let e = esc[k];
-                        let esc_next = if k < horizon {
-                            content[k + 1]
-                        } else if free {
-                            content[horizon]
-                        } else {
-                            continue; // max 封顶：esc[k] 不可达（未接线），跳过
-                        };
-                        let mut esc_edges: Vec<(u8, usize)> =
-                            (0..=255u8).map(|b| (b, esc_next)).collect();
-                        esc_edges[b'u' as usize].1 = u1[k];
-                        self.states[e].edges = esc_edges;
-                        // hex 边整块构建（48 个 hex 字节，按字节序）
-                        let hex_dst = [u2[k], u3[k], u4[k], esc_next];
-                        for (i, src) in [u1[k], u2[k], u3[k], u4[k]].iter().enumerate() {
-                            let edges: Vec<(u8, usize)> = (0..=255u8)
-                                .filter(|b| b.is_ascii_hexdigit())
-                                .map(|b| (b, hex_dst[i]))
-                                .collect();
-                            self.states[*src].edges = edges;
+                        self.add_edge(s1, b'"', sx);
+                        self.add_edge(s1, b'\\', esc);
+                        // esc 是全新状态：整块构建 256 条边（逐条 insert 会 O(n²) 拖慢大 schema）
+                        self.states[esc].edges = (0..=255u8).map(|b| (b, s1)).collect();
+                        self.set_final(sx);
+                        AutoOut {
+                            start: s0,
+                            exits: vec![sx],
                         }
-                    }
-                    AutoOut {
-                        start: s0,
-                        exits: vec![sx],
+                    } else {
+                        let max = max.unwrap_or(min as u64);
+                        if max < min as u64 {
+                            return Err(ZealotError::SchemaCompileError(format!(
+                                "string 空区间：minLength {min} > maxLength {max}"
+                            )));
+                        }
+                        let horizon = max as usize;
+                        if horizon > MAX_LENGTH_COUNTER {
+                            return Err(ZealotError::SchemaCompileError(format!(
+                                "minLength/maxLength {horizon} 过大（上限 {MAX_LENGTH_COUNTER}）"
+                            )));
+                        }
+                        let free = max_length.is_none(); // 仅 min：k == min 后冻结（吸收态）
+                                                         // 预建 content/esc/u 状态（k = 0..=horizon），再建入口 s0
+                        let mut content: Vec<usize> = Vec::with_capacity(horizon + 1);
+                        let mut esc: Vec<usize> = Vec::with_capacity(horizon + 1);
+                        let mut u1: Vec<usize> = Vec::with_capacity(horizon + 1);
+                        let mut u2: Vec<usize> = Vec::with_capacity(horizon + 1);
+                        let mut u3: Vec<usize> = Vec::with_capacity(horizon + 1);
+                        let mut u4: Vec<usize> = Vec::with_capacity(horizon + 1);
+                        for _ in 0..=horizon {
+                            content.push(self.new_state()?);
+                            esc.push(self.new_state()?);
+                            u1.push(self.new_state()?);
+                            u2.push(self.new_state()?);
+                            u3.push(self.new_state()?);
+                            u4.push(self.new_state()?);
+                        }
+                        let s0 = self.new_state()?;
+                        let sx = self.new_state()?;
+                        self.add_edge(s0, b'"', content[0]);
+                        self.set_final(sx);
+                        for k in 0..=horizon {
+                            let cur = content[k];
+                            let absorbing = free && k == horizon;
+                            // 内容边整块构建（按字节序自然有序；O(n²) 逐条 insert 拖慢大 horizon）
+                            let mut edges: Vec<(u8, usize)> = Vec::with_capacity(256);
+                            for b in 0..=255u8 {
+                                if b == b'"' {
+                                    // min 门控收尾
+                                    if k >= min {
+                                        edges.push((b, sx));
+                                    }
+                                } else if b == b'\\' {
+                                    // 转义：仅当可回落到活目标时接线（max 封顶处不可再转义）
+                                    if absorbing || k < horizon {
+                                        edges.push((b, esc[k]));
+                                    }
+                                } else if !(0x80..0xC0).contains(&b) {
+                                    // 码点首字节：+1；吸收态停留
+                                    if absorbing {
+                                        self.add_stay(cur, b);
+                                    } else if k < horizon {
+                                        edges.push((b, content[k + 1]));
+                                    }
+                                } else {
+                                    // UTF-8 连续字节：不计数（停留）
+                                    self.add_stay(cur, b);
+                                }
+                            }
+                            self.states[cur].edges = edges;
+                            // 转义结构：`\x`（非 u）→ +1；`\uXXXX` → +1（hex 链）
+                            let e = esc[k];
+                            let esc_next = if k < horizon {
+                                content[k + 1]
+                            } else if free {
+                                content[horizon]
+                            } else {
+                                continue; // max 封顶：esc[k] 不可达（未接线），跳过
+                            };
+                            let mut esc_edges: Vec<(u8, usize)> =
+                                (0..=255u8).map(|b| (b, esc_next)).collect();
+                            esc_edges[b'u' as usize].1 = u1[k];
+                            self.states[e].edges = esc_edges;
+                            // hex 边整块构建（48 个 hex 字节，按字节序）
+                            let hex_dst = [u2[k], u3[k], u4[k], esc_next];
+                            for (i, src) in [u1[k], u2[k], u3[k], u4[k]].iter().enumerate() {
+                                let edges: Vec<(u8, usize)> = (0..=255u8)
+                                    .filter(|b| b.is_ascii_hexdigit())
+                                    .map(|b| (b, hex_dst[i]))
+                                    .collect();
+                                self.states[*src].edges = edges;
+                            }
+                        }
+                        AutoOut {
+                            start: s0,
+                            exits: vec![sx],
+                        }
                     }
                 }
             }
@@ -796,6 +818,510 @@ impl AutoBuilder {
     }
 
     /// 从 cur 起消费字面字节；返回终点。
+    /// M5-⑦：format 字符串（内容字节级约束）。与 min/max 长度组合时用
+    /// 乘积状态 (format_state, k)——预算超限显式报错；format 内容不允许
+    /// 转义（`\\`/`"` 均不在任何格式字符集中）。
+    fn compile_format_string(
+        &mut self,
+        min: usize,
+        max: Option<u64>,
+        f: &StringFormat,
+    ) -> Result<AutoOut, ZealotError> {
+        let fstart = self.states.len();
+        let (fs, _ffinals) = self.build_format(f)?;
+        let f_count = self.states.len() - fstart;
+        let min_only = max.is_none();
+        let max = max.unwrap_or(min as u64);
+        if max < min as u64 {
+            return Err(ZealotError::SchemaCompileError(format!(
+                "string 空区间：minLength {min} > maxLength {max}"
+            )));
+        }
+        let horizon = max as usize;
+        if horizon > MAX_LENGTH_COUNTER {
+            return Err(ZealotError::SchemaCompileError(format!(
+                "minLength/maxLength {horizon} 过大（上限 {MAX_LENGTH_COUNTER}）"
+            )));
+        }
+        let cols = horizon + 1;
+        if f_count * cols > MAX_AUTO_STATES {
+            return Err(ZealotError::SchemaCompileError(format!(
+                "format+长度组合过大（{f_count} × {cols} 状态）"
+            )));
+        }
+        let absorbing = min_only; // 仅 min：k == horizon 后冻结
+                                  // 模板：format 自动机状态（边 + final）
+        let template: Vec<(Vec<(u8, usize)>, bool)> = self.states[fstart..]
+            .iter()
+            .map(|st| (st.edges.clone(), st.is_final))
+            .collect();
+        let s0 = self.new_state()?;
+        let sx = self.new_state()?;
+        let mut grid: Vec<usize> = Vec::with_capacity(f_count * cols);
+        for _ in 0..(f_count * cols) {
+            grid.push(self.new_state()?);
+        }
+        let idx = |fi: usize, k: usize| fi * cols + k;
+        self.add_edge(s0, b'"', grid[idx(fs - fstart, 0)]);
+        self.set_final(sx);
+        for (fi, (edges, is_final)) in template.iter().enumerate() {
+            for k in 0..=horizon {
+                let cur = grid[idx(fi, k)];
+                for &(b, t) in edges {
+                    let tf = t - fstart;
+                    let k2 = if absorbing {
+                        (k + cp_count(b)).min(horizon)
+                    } else if k + cp_count(b) <= horizon {
+                        k + cp_count(b)
+                    } else {
+                        continue; // max 封顶：不可再续
+                    };
+                    self.add_edge(cur, b, grid[idx(tf, k2)]);
+                }
+                if *is_final && k >= min {
+                    self.add_edge(cur, b'"', sx);
+                }
+            }
+        }
+        Ok(AutoOut {
+            start: s0,
+            exits: vec![sx],
+        })
+    }
+
+    fn build_format(&mut self, f: &StringFormat) -> Result<(usize, Vec<usize>), ZealotError> {
+        match f {
+            StringFormat::Email => self.build_email(),
+            StringFormat::Date => self.build_date(),
+            StringFormat::DateTime => self.build_datetime(),
+            StringFormat::Time => self.build_time(),
+            StringFormat::Uuid => self.build_uuid(),
+            StringFormat::Ipv4 => self.build_ipv4(),
+            StringFormat::Ipv6 => self.build_ipv6(),
+            StringFormat::Hostname => self.build_hostname(),
+            StringFormat::Uri => self.build_uri(),
+        }
+    }
+
+    /// email：local（点不可首尾/连续）@ 域名（label：字母数字首尾、中缀连字符）
+    fn build_email(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let is_local = |b: u8| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'/'
+                        | b'='
+                        | b'?'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'{'
+                        | b'|'
+                        | b'}'
+                        | b'~'
+                        | b'-'
+                )
+        };
+        let l0 = self.new_state()?;
+        let l1 = self.new_state()?;
+        let l2 = self.new_state()?;
+        for b in 0..=255u8 {
+            if is_local(b) && b != b'.' {
+                self.add_edge(l0, b, l1);
+                self.add_edge(l1, b, l1);
+                self.add_edge(l2, b, l1);
+            }
+        }
+        self.add_edge(l1, b'.', l2);
+        let d0 = self.new_state()?;
+        let d1 = self.new_state()?;
+        let d2 = self.new_state()?;
+        let d3 = self.new_state()?;
+        self.add_edge(l1, b'@', d0);
+        for b in 0..=255u8 {
+            if b.is_ascii_alphanumeric() {
+                self.add_edge(d0, b, d1);
+                self.add_edge(d1, b, d1);
+                self.add_edge(d2, b, d1);
+                self.add_edge(d3, b, d1);
+            }
+        }
+        self.add_edge(d1, b'-', d3);
+        self.add_edge(d1, b'.', d2);
+        self.set_final(d1);
+        Ok((l0, vec![d1]))
+    }
+
+    /// date：YYYY-MM-DD（月 01-12、日 01-31，结构校验）
+    fn build_date(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let y1 = self.new_state()?;
+        let y4 = self.digit_chain(y1, 4)?;
+        let dash1 = self.new_state()?;
+        self.add_edge(y4, b'-', dash1);
+        let ma = self.new_state()?; // 月首 0
+        let mb = self.new_state()?; // 月首 1
+        let md = self.new_state()?;
+        self.add_edge(dash1, b'0', ma);
+        self.add_edge(dash1, b'1', mb);
+        for b in b'1'..=b'9' {
+            self.add_edge(ma, b, md);
+        }
+        for b in b'0'..=b'2' {
+            self.add_edge(mb, b, md);
+        }
+        let dash2 = self.new_state()?;
+        self.add_edge(md, b'-', dash2);
+        let da = self.new_state()?; // 日首 0
+        let db = self.new_state()?; // 日首 1|2
+        let dc = self.new_state()?; // 日首 3
+        self.add_edge(dash2, b'0', da);
+        self.add_edge(dash2, b'1', db);
+        self.add_edge(dash2, b'2', db);
+        self.add_edge(dash2, b'3', dc);
+        for b in b'1'..=b'9' {
+            self.add_edge(da, b, da);
+        }
+        for b in b'0'..=b'9' {
+            self.add_edge(db, b, db);
+        }
+        for b in b'0'..=b'1' {
+            self.add_edge(dc, b, dc);
+        }
+        self.set_final(da);
+        self.set_final(db);
+        self.set_final(dc);
+        Ok((y1, vec![da, db, dc]))
+    }
+
+    /// time：HH:MM:SS(.f+)?(Z|[+-]HH:MM)?（24 小时制）
+    fn build_time(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let h1 = self.new_state()?;
+        let ha = self.new_state()?; // 时首 0|1
+        let hb = self.new_state()?; // 时首 2
+        let hx = self.new_state()?; // 时完成
+        self.add_edge(h1, b'0', ha);
+        self.add_edge(h1, b'1', ha);
+        self.add_edge(h1, b'2', hb);
+        for b in b'0'..=b'9' {
+            self.add_edge(ha, b, hx);
+        }
+        for b in b'0'..=b'3' {
+            self.add_edge(hb, b, hx);
+        }
+        let c1 = self.new_state()?;
+        self.add_edge(hx, b':', c1);
+        let m1 = self.new_state()?;
+        let m2 = self.new_state()?;
+        for b in b'0'..=b'5' {
+            self.add_edge(c1, b, m1);
+        }
+        for b in b'0'..=b'9' {
+            self.add_edge(m1, b, m2);
+        }
+        let c2 = self.new_state()?;
+        self.add_edge(m2, b':', c2);
+        let s1 = self.new_state()?;
+        let s2 = self.new_state()?;
+        for b in b'0'..=b'5' {
+            self.add_edge(c2, b, s1);
+        }
+        for b in b'0'..=b'9' {
+            self.add_edge(s1, b, s2);
+        }
+        self.set_final(s2);
+        // 小数秒
+        let frac = self.new_state()?;
+        self.add_edge(s2, b'.', frac);
+        for b in b'0'..=b'9' {
+            self.add_edge(frac, b, frac);
+        }
+        self.set_final(frac);
+        // 时区：Z / ±HH:MM
+        let z_end = self.new_state()?;
+        let o1 = self.new_state()?;
+        let oa = self.new_state()?; // 偏移时首 0|1
+        let ob = self.new_state()?; // 偏移时首 2
+        let oc = self.new_state()?;
+        let o3 = self.new_state()?;
+        let o4 = self.new_state()?;
+        for base in [s2, frac] {
+            self.add_edge(base, b'Z', z_end);
+            self.add_edge(base, b'z', z_end);
+            self.add_edge(base, b'+', o1);
+            self.add_edge(base, b'-', o1);
+        }
+        self.add_edge(o1, b'0', oa);
+        self.add_edge(o1, b'1', oa);
+        self.add_edge(o1, b'2', ob);
+        for b in b'0'..=b'9' {
+            self.add_edge(oa, b, oc);
+        }
+        for b in b'0'..=b'3' {
+            self.add_edge(ob, b, oc);
+        }
+        self.add_edge(oc, b':', o3);
+        for b in b'0'..=b'5' {
+            self.add_edge(o3, b, o4);
+        }
+        for b in b'0'..=b'9' {
+            self.add_edge(o4, b, z_end);
+        }
+        self.set_final(z_end);
+        Ok((h1, vec![s2, frac, z_end]))
+    }
+
+    /// date-time：date T time（T/t 分隔，RFC3339）——日期终态降级为中间态（不可裸收尾）
+    fn build_datetime(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let (ds, dfs) = self.build_date()?;
+        let (ts, tfs) = self.build_time()?;
+        for &df in &dfs {
+            self.states[df].is_final = false; // 裸日期不可作为 date-time 收尾
+            self.add_edge(df, b'T', ts);
+            self.add_edge(df, b't', ts);
+        }
+        Ok((ds, tfs))
+    }
+
+    /// uuid：8-4-4-4-12 hex
+    fn build_uuid(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let s = self.new_state()?;
+        let h8 = self.digit_chain_hex(s, 8)?;
+        let d1 = self.new_state()?;
+        self.add_edge(h8, b'-', d1);
+        let h4a = self.digit_chain_hex(d1, 4)?;
+        let d2 = self.new_state()?;
+        self.add_edge(h4a, b'-', d2);
+        let h4b = self.digit_chain_hex(d2, 4)?;
+        let d3 = self.new_state()?;
+        self.add_edge(h4b, b'-', d3);
+        let h4c = self.digit_chain_hex(d3, 4)?;
+        let d4 = self.new_state()?;
+        self.add_edge(h4c, b'-', d4);
+        let h12 = self.digit_chain_hex(d4, 12)?;
+        self.set_final(h12);
+        Ok((s, vec![h12]))
+    }
+
+    /// ipv4：四段 0-255（无前导零）
+    fn build_ipv4(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let s1 = self.new_state()?;
+        let mut starts = vec![s1];
+        let mut last_ends = Vec::new();
+        for i in 0..4 {
+            let os = starts[i];
+            let oz = self.new_state()?;
+            let ot1 = self.new_state()?; // 首 1
+            let ot2 = self.new_state()?; // 首 2
+            let ot9 = self.new_state()?; // 首 3-9
+            let oh = self.new_state()?;
+            let oh5 = self.new_state()?;
+            let ou = self.new_state()?;
+            self.add_edge(os, b'0', oz);
+            self.add_edge(os, b'1', ot1);
+            self.add_edge(os, b'2', ot2);
+            for b in b'3'..=b'9' {
+                self.add_edge(os, b, ot9);
+            }
+            for b in b'0'..=b'9' {
+                self.add_edge(ot1, b, oh);
+                self.add_edge(ot9, b, oh);
+            }
+            for b in b'0'..=b'4' {
+                self.add_edge(ot2, b, oh);
+            }
+            self.add_edge(ot2, b'5', oh5);
+            for b in b'0'..=b'9' {
+                self.add_edge(oh, b, ou);
+            }
+            for b in b'0'..=b'5' {
+                self.add_edge(oh5, b, ou);
+            }
+            let ends = vec![oz, ot1, ot2, ot9, oh, oh5, ou];
+            if i < 3 {
+                let next = self.new_state()?;
+                for &e in &ends {
+                    self.add_edge(e, b'.', next);
+                }
+                starts.push(next);
+            } else {
+                for &e in &ends {
+                    self.set_final(e);
+                }
+                last_ends = ends;
+            }
+        }
+        Ok((s1, last_ends))
+    }
+
+    /// ipv6：8 组 hex + 至多一个 `::` 压缩（RFC 4291 结构；不含内嵌 IPv4）
+    fn build_ipv6(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let mut h: Vec<Vec<usize>> = vec![vec![]; 1]; // H(g, d) g∈1..=8, d∈1..=4（行含 0 位占位）
+        h.extend(
+            (1..=8)
+                .map(|_| -> Result<Vec<usize>, ZealotError> {
+                    let mut row = vec![0usize];
+                    row.extend(
+                        (1..=4)
+                            .map(|_| self.new_state())
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let b: Vec<usize> = (0..8)
+            .map(|_| self.new_state())
+            .collect::<Result<Vec<_>, _>>()?; // B(g) g∈0..=7
+        let cc: Vec<usize> = (0..8)
+            .map(|_| self.new_state())
+            .collect::<Result<Vec<_>, _>>()?; // CC(g)
+        let mut c: Vec<Vec<usize>> = vec![vec![]; 1]; // C(g, d) g∈1..=7（行含 0 位占位）
+        c.extend(
+            (1..=7)
+                .map(|_| -> Result<Vec<usize>, ZealotError> {
+                    let mut row = vec![0usize];
+                    row.extend(
+                        (1..=4)
+                            .map(|_| self.new_state())
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let cb: Vec<usize> = (1..=7)
+            .map(|_| self.new_state())
+            .collect::<Result<Vec<_>, _>>()?; // CB(g)
+        let s = self.new_state()?;
+        self.add_hex_edges(s, h[1][1]);
+        self.add_edge(s, b':', b[0]);
+        for g in 1..=8 {
+            for d in 1..=4 {
+                if d < 4 {
+                    self.add_hex_edges(h[g][d], h[g][d + 1]);
+                }
+                if g < 8 {
+                    self.add_edge(h[g][d], b':', b[g]);
+                }
+            }
+        }
+        for g in 0..8 {
+            self.add_hex_edges(b[g], h[g + 1][1]);
+            self.add_edge(b[g], b':', cc[g]);
+        }
+        for g in 0..8 {
+            if g < 7 {
+                self.add_hex_edges(cc[g], c[g + 1][1]);
+            }
+            self.set_final(cc[g]);
+        }
+        for g in 1..=7 {
+            for d in 1..=4 {
+                if d < 4 {
+                    self.add_hex_edges(c[g][d], c[g][d + 1]);
+                }
+                if g < 7 {
+                    self.add_edge(c[g][d], b':', cb[g]);
+                }
+                self.set_final(c[g][d]);
+            }
+        }
+        for g in 1..=7 {
+            if g < 7 {
+                self.add_hex_edges(cb[g], c[g + 1][1]);
+            }
+        }
+        for &st in h[8].iter().skip(1) {
+            self.set_final(st);
+        }
+        let mut finals: Vec<usize> = h[8].iter().skip(1).copied().collect();
+        finals.extend(cc);
+        for row in c.iter().skip(1) {
+            finals.extend(row.iter().skip(1).copied());
+        }
+        Ok((s, finals))
+    }
+
+    /// hostname：点分 label（字母数字首尾、中缀连字符，≥1 个 label）
+    fn build_hostname(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let l0 = self.new_state()?;
+        let l1 = self.new_state()?;
+        let l2 = self.new_state()?;
+        for b in 0..=255u8 {
+            if b.is_ascii_alphanumeric() {
+                self.add_edge(l0, b, l1);
+                self.add_edge(l1, b, l1);
+                self.add_edge(l2, b, l1);
+            }
+        }
+        self.add_edge(l1, b'-', l2);
+        self.add_edge(l1, b'.', l0);
+        self.set_final(l1);
+        Ok((l0, vec![l1]))
+    }
+
+    /// uri：scheme（字母开头，字母数字+.-）`:` + 非空白/控制/引号字节（宽松子集）
+    fn build_uri(&mut self) -> Result<(usize, Vec<usize>), ZealotError> {
+        let u0 = self.new_state()?;
+        let u1 = self.new_state()?;
+        let u2 = self.new_state()?;
+        for b in 0..=255u8 {
+            if b.is_ascii_alphabetic() {
+                self.add_edge(u0, b, u1);
+            }
+            if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.') {
+                self.add_edge(u1, b, u1);
+            }
+            if b > 0x20 && b != 0x7F && b != b'"' && b != b'\\' {
+                self.add_edge(u2, b, u2);
+            }
+        }
+        self.add_edge(u1, b':', u2);
+        self.set_final(u2);
+        Ok((u0, vec![u2]))
+    }
+
+    fn add_hex_edges(&mut self, s: usize, t: usize) {
+        for b in b'0'..=b'9' {
+            self.add_edge(s, b, t);
+        }
+        for b in b'a'..=b'f' {
+            self.add_edge(s, b, t);
+        }
+        for b in b'A'..=b'F' {
+            self.add_edge(s, b, t);
+        }
+    }
+
+    fn digit_chain(&mut self, from: usize, len: usize) -> Result<usize, ZealotError> {
+        let mut cur = from;
+        for _ in 0..len {
+            let n = self.new_state()?;
+            for b in b'0'..=b'9' {
+                self.add_edge(cur, b, n);
+            }
+            cur = n;
+        }
+        Ok(cur)
+    }
+
+    fn digit_chain_hex(&mut self, from: usize, len: usize) -> Result<usize, ZealotError> {
+        let mut cur = from;
+        for _ in 0..len {
+            let n = self.new_state()?;
+            self.add_hex_edges(cur, n);
+            cur = n;
+        }
+        Ok(cur)
+    }
+
     fn chain_from(&mut self, cur: usize, bytes: &[u8]) -> Result<usize, ZealotError> {
         let mut c = cur;
         for &b in bytes {
@@ -1094,6 +1620,15 @@ impl AutoBuilder {
     }
 }
 
+/// M5-⑥/⑦：字节的码点数贡献（UTF-8 首字节/ASCII = 1，连续字节 = 0）。
+fn cp_count(b: u8) -> usize {
+    if (0x80..0xC0).contains(&b) {
+        0
+    } else {
+        1
+    }
+}
+
 fn decimal_digits(mut n: u64) -> Vec<u8> {
     if n == 0 {
         return vec![0];
@@ -1169,6 +1704,7 @@ impl ConstrainedGrammar {
                 max_length: _,
                 pattern: _,
                 enum_values,
+                format: _,
             } => {
                 let mut tokens: Vec<i32> = vec![34]; // opening quote
                 if *min_length > 0 {
@@ -1292,6 +1828,7 @@ mod tests {
             max_length: Some(100),
             pattern: None,
             enum_values: None,
+            format: None,
         });
         let tokens = g.allowed_tokens(0).unwrap();
         assert!(tokens.contains(&34)); // opening quote
@@ -1324,6 +1861,7 @@ mod tests {
                 max_length: None,
                 pattern: None,
                 enum_values: None,
+                format: None,
             },
         );
         let g = ConstrainedGrammar::new(GrammarType::Object {
@@ -1361,6 +1899,7 @@ mod tests {
             max_length: None,
             pattern: None,
             enum_values: None,
+            format: None,
         }
     }
 
@@ -1775,6 +2314,7 @@ mod tests {
                 max_length: max,
                 pattern: None,
                 enum_values: None,
+                format: None,
             })
         };
         // 仅 min
@@ -1847,6 +2387,7 @@ mod tests {
                 max_length: max,
                 pattern: None,
                 enum_values: None,
+                format: None,
             })
         };
         // 转义计数：`\\n` = 1、`\\uXXXX` = 1
@@ -1903,6 +2444,7 @@ mod tests {
             max_length: Some(2),
             pattern: None,
             enum_values: None,
+            format: None,
         };
         assert!(ByteAutomaton::compile(&bad1).is_err(), "min > max 应报错");
         let bad2 = GrammarType::String {
@@ -1910,6 +2452,7 @@ mod tests {
             max_length: Some(MAX_LENGTH_COUNTER as u64 + 1),
             pattern: None,
             enum_values: None,
+            format: None,
         };
         assert!(ByteAutomaton::compile(&bad2).is_err(), "horizon 过大应报错");
         let bad3 = GrammarType::String {
@@ -1917,6 +2460,7 @@ mod tests {
             max_length: None,
             pattern: None,
             enum_values: None,
+            format: None,
         };
         assert!(ByteAutomaton::compile(&bad3).is_err(), "min 过大应报错");
         let g = ConstrainedGrammar::new(bad1);
@@ -1931,6 +2475,7 @@ mod tests {
             max_length: Some(3),
             pattern: Some("^[a-z]+$".into()),
             enum_values: None,
+            format: None,
         });
         assert_eq!(walk(&g, b"\"ab\""), (true, true));
         assert_eq!(
@@ -1950,6 +2495,280 @@ mod tests {
         assert_eq!(walk(&g, b"\"green\""), (true, true));
         assert_eq!(walk(&g, b"\"blue\""), (false, false));
         assert_eq!(walk(&g, b"1"), (true, true), "非字符串枚举值");
+    }
+
+    #[test]
+    fn test_automaton_format_email() {
+        let g = fmt_grammar(StringFormat::Email);
+        for ok in [
+            b"\"a@b.c\"".as_slice(),
+            b"\"user.name+tag@example-domain.co.uk\"",
+            b"\"a!b@c\"",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "{}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [
+            b"\"a\"".as_slice(),
+            b"\"a@\"",
+            b"\"@b.c\"",
+            b"\".a@b.c\"",
+            b"\"a.@b.c\"",
+            b"\"a@b.\"",
+            b"\"a b@c\"",
+        ] {
+            assert!(!walk(&g, bad).1, "{} 应非法", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn test_automaton_format_date_time() {
+        let g = fmt_grammar(StringFormat::Date);
+        for ok in [
+            b"\"2024-02-29\"".as_slice(),
+            b"\"0000-01-01\"",
+            b"\"9999-12-31\"",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "date {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [
+            b"\"2024-13-01\"".as_slice(),
+            b"\"2024-00-01\"",
+            b"\"2024-01-32\"",
+            b"\"2024-01-00\"",
+            b"\"24-01-01\"",
+            b"\"2024/01/01\"",
+        ] {
+            assert!(
+                !walk(&g, bad).1,
+                "date {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let g = fmt_grammar(StringFormat::DateTime);
+        for ok in [
+            b"\"2024-01-01T00:00:00Z\"".as_slice(),
+            b"\"2024-01-01t23:59:59+08:00\"",
+            b"\"2024-01-01T12:00:00.123Z\"",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "dt {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [
+            b"\"2024-01-01\"".as_slice(),
+            b"\"2024-01-01 00:00:00Z\"",
+            b"\"2024-01-01T24:00:00Z\"",
+            b"\"2024-01-01T12:60:00Z\"",
+        ] {
+            assert!(
+                !walk(&g, bad).1,
+                "dt {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let g = fmt_grammar(StringFormat::Time);
+        for ok in [
+            b"\"00:00:00\"".as_slice(),
+            b"\"23:59:59\"",
+            b"\"12:00:00.5Z\"",
+            b"\"01:02:03+05:30\"",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "time {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"\"24:00:00\"".as_slice(), b"\"12:00\"", b"\"12:00:60\""] {
+            assert!(
+                !walk(&g, bad).1,
+                "time {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn test_automaton_format_uuid_ip() {
+        let g = fmt_grammar(StringFormat::Uuid);
+        let ok = b"\"123e4567-e89b-12d3-a456-426614174000\"";
+        assert_eq!(walk(&g, ok), (true, true));
+        for bad in [
+            b"\"123e4567e89b12d3a456426614174000\"".as_slice(),
+            b"\"123e4567-e89b-12d3-a456-42661417400g\"",
+            b"\"123e4567-e89b-12d3-a456-4266141740\"",
+        ] {
+            assert!(
+                !walk(&g, bad).1,
+                "uuid {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let g = fmt_grammar(StringFormat::Ipv4);
+        for ok in [
+            b"\"0.0.0.0\"".as_slice(),
+            b"\"255.255.255.255\"",
+            b"\"192.168.1.1\"",
+            b"\"1.2.3.4\"",
+            b"\"10.0.0.255\"",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "ipv4 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [
+            b"\"256.0.0.1\"".as_slice(),
+            b"\"01.2.3.4\"",
+            b"\"1.2.3\"",
+            b"\"1.2.3.4.5\"",
+            b"\"255.255.255.256\"",
+            b"\"1.2.3.-4\"",
+        ] {
+            assert!(
+                !walk(&g, bad).1,
+                "ipv4 {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let g = fmt_grammar(StringFormat::Ipv6);
+        for ok in [
+            b"\"2001:0db8:85a3:0000:0000:8a2e:0370:7334\"".as_slice(),
+            b"\"::1\"",
+            b"\"::\"",
+            b"\"fe80::1\"",
+            b"\"1:2:3:4:5:6:7:8\"",
+            b"\"1::\"",
+            b"\"::ffff:1:2\"",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "ipv6 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [
+            b"\"1:2:3\"".as_slice(),
+            b"\"1:2:3:4:5:6:7:8:9\"",
+            b"\"1::2::3\"",
+            b"\"1:2:3:4:5:6:7:8:\"",
+            b"\"12345::\"",
+            b"\"1::2:\"",
+            b"\"g::1\"",
+        ] {
+            assert!(
+                !walk(&g, bad).1,
+                "ipv6 {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn test_automaton_format_hostname_uri() {
+        let g = fmt_grammar(StringFormat::Hostname);
+        for ok in [
+            b"\"localhost\"".as_slice(),
+            b"\"example.com\"",
+            b"\"sub-domain.example.co.uk\"",
+            b"\"a1-b2.c3\"",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "hn {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [
+            b"\"-a.com\"".as_slice(),
+            b"\"a-.com\"",
+            b"\"a..b\"",
+            b"\"a.\"",
+            b"\"a b.com\"",
+        ] {
+            assert!(
+                !walk(&g, bad).1,
+                "hn {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let g = fmt_grammar(StringFormat::Uri);
+        for ok in [
+            b"\"https://example.com/path?q=1#f\"".as_slice(),
+            b"\"mailto:user@example.com\"",
+            b"\"urn:isbn:0451450523\"",
+            b"\"a:/b\"",
+        ] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "uri {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"\"1http://x\"".as_slice(), b"\"http:\\x\"", b"\"a b:c\""] {
+            assert!(
+                !walk(&g, bad).1,
+                "uri {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn test_automaton_format_with_length() {
+        // format × 长度组合
+        let g = ConstrainedGrammar::new(GrammarType::String {
+            min_length: 8,
+            max_length: Some(12),
+            pattern: None,
+            enum_values: None,
+            format: Some(StringFormat::Date),
+        });
+        assert_eq!(
+            walk(&g, b"\"2024-01-01\""),
+            (true, true),
+            "10 码点 ∈ [8,12]"
+        );
+        assert_eq!(walk(&g, b"\"2024-1-1\""), (false, false), "非法日期");
+        let g = ConstrainedGrammar::new(GrammarType::String {
+            min_length: 10,
+            max_length: None,
+            pattern: None,
+            enum_values: None,
+            format: Some(StringFormat::Date),
+        });
+        assert_eq!(walk(&g, b"\"2024-01-01\""), (true, true), "min-only 冻结");
+        assert_eq!(walk(&g, b"\"2024-01-0"), (true, false), "前缀可续写");
+    }
+
+    /// format 测试辅助
+    fn fmt_grammar(f: StringFormat) -> ConstrainedGrammar {
+        ConstrainedGrammar::new(GrammarType::String {
+            min_length: 0,
+            max_length: None,
+            pattern: None,
+            enum_values: None,
+            format: Some(f),
+        })
     }
 
     #[test]
