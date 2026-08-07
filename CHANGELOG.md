@@ -7,6 +7,10 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M4 收官：pytest 集成测试面落地（issue #9）——test_block_manager.py
+  （接口一致性/错误转换/StaleHandle/池语义）+ test_constrained_decode.py
+  （编译/缓存/边界/嵌套深度/对抗性 10001 属性 schema 拒绝 §12-6/超时守卫），
+  22 用例全绿；README 修正 pytest 声明与过期 Python API 文档
 - M4 收官：§8.1 FFI 微基准 8 项落地（issue #8）——criterion benches/
   BlockManager 6 项全部达标（allocate 36.8ns / free 38.4ns / reference
   10.1ns / stale 4.4ns / GIL 61ns），decode 2 项超阈值标风险

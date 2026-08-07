@@ -44,7 +44,8 @@ zealot/
 │   ├── model_runner_py.rs    # PyModelRunner：PyO3 嵌入 torch CPU 前向（dev-mode）
 │   └── bin/
 │       └── zealot-backend.rs # Runtime Interface gRPC server + HTTP OpenAI endpoint
-└── tests/                    # backend_e2e.rs + cpu_infer_e2e.rs（真实模型 CPU 端到端）+ pytest
+└── tests/                    # backend_e2e.rs + cpu_infer_e2e.rs（真实模型 CPU 端到端）
+                              # + pytest：test_block_manager.py / test_constrained_decode.py（PyO3 接口）
 ```
 
 ## 模块设计
@@ -55,12 +56,13 @@ PagedAttention 内存管理的 Rust 实现。vLLM 的 Python 原版用手动引�
 
 **Python API**：
 ```python
-import zealot_engine
-bm = zealot_engine.BlockManager(num_gpu_blocks=1024, block_size=16)
-block_id = bm.allocate()       # → int
-bm.reference(block_id)          # refcount++
-bm.free(block_id)               # refcount--, 归零时回收
-bm.free_blocks                  # → int
+import zealot_engine as ze
+bm = ze.BlockManager(num_gpu_blocks=1024, block_size=16)
+h = bm.allocate()               # → BlockHandle(id, generation)
+bm.reference(h)                 # refcount++（须在最后一次 free 之前）
+bm.free(h)                      # refcount--, 归零时回收
+bm.free_blocks                  # → int（空闲 block 数）
+# 对已释放 handle 操作 → RuntimeError("Stale handle: ...")（generation 门控）
 ```
 
 **状态**：Phase 2 M4（GPU-free 可开发，分页算法用常规堆内存测试）
@@ -71,7 +73,7 @@ bm.free_blocks                  # → int
 
 **Python API**：
 ```python
-compiler = zealot_engine.JsonSchemaCompiler()
+compiler = ze.JsonSchemaCompiler(cache_size=128, max_states=10_000, max_compile_ms=1000)
 grammar = compiler.compile('{"type":"object","properties":{...}}')
 grammar.allowed_tokens(state)  # → List[int]
 grammar.advance(state, token)  # → int (next state)
@@ -150,7 +152,7 @@ cargo test --test cpu_infer_e2e -- --nocapture
 ## 测试策略
 
 - **Rust 单元测试**：每个 crate 内的 `#[cfg(test)]` 模块，覆盖纯逻辑
-- **Python 集成测试**：pytest + `import zealot_engine`，验证 PyO3 接口
+- **Python 集成测试**：`pytest tests/`（前置：`maturin develop` 安装扩展）——PyO3 接口一致性、错误转换、StaleHandle 检测、对抗性 schema 拒绝（§12-6）
 - **GPU 集成测试**（Phase 2 后期）：真实 GPU 环境，验证 Block Manager ↔ CUDA 交互
 - **Property-based testing**：Block Manager 分配/释放序列的随机测试（proptest）
 

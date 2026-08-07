@@ -507,6 +507,6 @@ target/wheels/
 - [x] `allocate()` 延迟 < 500ns（benchmark 验证，实测 36.8ns，见 §8.1）
 - [ ] `JsonSchemaCompiler::compile()` 有 `max_states` / `max_compile_ms` 防护
 - [ ] `JsonSchemaCompiler` 有 schema hash 缓存 + LRU 淘汰
-- [ ] 对抗性 schema 拒绝测试（pytest + 10000 状态 schema）
+- [x] 对抗性 schema 拒绝测试（pytest + 10000 状态 schema）
 - [ ] §8.1 的 8 个 FFI benchmark 全部在 CI 中运行
 - [ ] `phase2_lifecycle.md` 单独文档，描述 Phase 2 可运行的完整路径
