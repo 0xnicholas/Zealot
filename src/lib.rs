@@ -14,9 +14,9 @@ pub mod gpu_context;
 #[cfg(feature = "cuda")]
 pub mod kv_cache;
 pub mod model_loader;
-pub mod openai;
 pub mod model_runner_cpu;
 pub mod model_runner_py;
+pub mod openai;
 pub mod sampling;
 pub mod scheduler;
 pub mod tokenizer;

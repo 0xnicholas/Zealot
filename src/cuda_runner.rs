@@ -80,35 +80,31 @@ impl CudaModelRunner {
         )?;
 
         // 6. Tokenizer + eos_token_id (PyO3, same pattern as CpuModelRunner)
-        let tokenizer_py = Python::with_gil(
-            |py| -> Result<Option<Py<PyAny>>, ZealotError> {
-                if let Ok(sp) = std::env::var("ZEALOT_SITE_PACKAGES") {
-                    let sys = py
-                        .import("sys")
-                        .map_err(model_loader::py_err("import sys"))?;
-                    sys.getattr("path")
-                        .map_err(model_loader::py_err("sys.path"))?
-                        .call_method1("insert", (0, sp))
-                        .map_err(model_loader::py_err("sys.path.insert"))?;
-                }
+        let tokenizer_py = Python::with_gil(|py| -> Result<Option<Py<PyAny>>, ZealotError> {
+            if let Ok(sp) = std::env::var("ZEALOT_SITE_PACKAGES") {
+                let sys = py
+                    .import("sys")
+                    .map_err(model_loader::py_err("import sys"))?;
+                sys.getattr("path")
+                    .map_err(model_loader::py_err("sys.path"))?
+                    .call_method1("insert", (0, sp))
+                    .map_err(model_loader::py_err("sys.path.insert"))?;
+            }
 
-                let _torch = py
-                    .import("torch")
-                    .map_err(model_loader::py_err(
-                        "import torch (venv? set ZEALOT_SITE_PACKAGES)",
-                    ))?;
-                let transformers = py
-                    .import("transformers")
-                    .map_err(model_loader::py_err("import transformers"))?;
+            let _torch = py.import("torch").map_err(model_loader::py_err(
+                "import torch (venv? set ZEALOT_SITE_PACKAGES)",
+            ))?;
+            let transformers = py
+                .import("transformers")
+                .map_err(model_loader::py_err("import transformers"))?;
 
-                let tokenizer = transformers
-                    .getattr("AutoTokenizer")
-                    .map_err(model_loader::py_err("AutoTokenizer"))?
-                    .call_method1("from_pretrained", (model_id,))
-                    .map_err(model_loader::py_err("tokenizer from_pretrained"))?;
-                Ok(Some(tokenizer.unbind()))
-            },
-        )?;
+            let tokenizer = transformers
+                .getattr("AutoTokenizer")
+                .map_err(model_loader::py_err("AutoTokenizer"))?
+                .call_method1("from_pretrained", (model_id,))
+                .map_err(model_loader::py_err("tokenizer from_pretrained"))?;
+            Ok(Some(tokenizer.unbind()))
+        })?;
 
         let eos_token_id = extract_eos(tokenizer_py.as_ref());
 
@@ -137,7 +133,17 @@ impl CudaModelRunner {
         let dummy_ptr = dev_ptr(&dummy);
         let out_ptr = dev_ptr_mut(&mut out);
         self.ctx.cublas.sgemm(
-            1, 1, 1, dummy_ptr, 1, CublasOp::N, dummy_ptr, 1, CublasOp::N, out_ptr, 1,
+            1,
+            1,
+            1,
+            dummy_ptr,
+            1,
+            CublasOp::N,
+            dummy_ptr,
+            1,
+            CublasOp::N,
+            out_ptr,
+            1,
         )?;
         Ok(())
     }
@@ -173,7 +179,11 @@ impl CudaModelRunner {
         let out_ptr = dev_ptr_mut(out);
 
         let cfg = LaunchConfig {
-            grid_dim: (((seq_len + 255) / 256) as u32, ((hidden_dim + 31) / 32) as u32, 1),
+            grid_dim: (
+                ((seq_len + 255) / 256) as u32,
+                ((hidden_dim + 31) / 32) as u32,
+                1,
+            ),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -202,11 +212,8 @@ impl CudaModelRunner {
         seq_len: usize,
         hidden_dim: usize,
     ) -> Result<(), ZealotError> {
-        unsafe {
-            self.launch_embedding_gather_impl(ids, embedding, out, seq_len, hidden_dim)
-        }
+        unsafe { self.launch_embedding_gather_impl(ids, embedding, out, seq_len, hidden_dim) }
     }
-
 }
 
 // ── ModelRunner trait impl ──────────────────────────────────────────────────
@@ -214,50 +221,47 @@ impl CudaModelRunner {
 impl ModelRunner for CudaModelRunner {
     fn tokenize_chat(&self, messages: &[(String, String)]) -> Result<Vec<i64>, ZealotError> {
         // Duplicated from CpuModelRunner — acceptable for Sprint A.
-        Python::with_gil(
-            |py| -> Result<Vec<i64>, ZealotError> {
-                let tokenizer = self
-                    .tokenizer_py
-                    .as_ref()
-                    .ok_or_else(|| ZealotError::Internal("tokenizer not loaded".into()))?
-                    .bind(py);
-                let list = PyList::empty(py);
-                for (role, content) in messages {
-                    let d = PyDict::new(py);
-                    d.set_item("role", role)
-                        .map_err(model_loader::py_err("msg role"))?;
-                    d.set_item("content", content)
-                        .map_err(model_loader::py_err("msg content"))?;
-                    list.append(d)
-                        .map_err(model_loader::py_err("msg append"))?;
-                }
-                let kwargs = PyDict::new(py);
-                kwargs
-                    .set_item("tokenize", true)
-                    .map_err(model_loader::py_err("kw"))?;
-                kwargs
-                    .set_item("add_generation_prompt", true)
-                    .map_err(model_loader::py_err("kw"))?;
-                match tokenizer.call_method("apply_chat_template", (list,), Some(&kwargs)) {
-                    Ok(ids) => ids
+        Python::with_gil(|py| -> Result<Vec<i64>, ZealotError> {
+            let tokenizer = self
+                .tokenizer_py
+                .as_ref()
+                .ok_or_else(|| ZealotError::Internal("tokenizer not loaded".into()))?
+                .bind(py);
+            let list = PyList::empty(py);
+            for (role, content) in messages {
+                let d = PyDict::new(py);
+                d.set_item("role", role)
+                    .map_err(model_loader::py_err("msg role"))?;
+                d.set_item("content", content)
+                    .map_err(model_loader::py_err("msg content"))?;
+                list.append(d).map_err(model_loader::py_err("msg append"))?;
+            }
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item("tokenize", true)
+                .map_err(model_loader::py_err("kw"))?;
+            kwargs
+                .set_item("add_generation_prompt", true)
+                .map_err(model_loader::py_err("kw"))?;
+            match tokenizer.call_method("apply_chat_template", (list,), Some(&kwargs)) {
+                Ok(ids) => ids
+                    .extract::<Vec<i64>>()
+                    .map_err(model_loader::py_err("chat_template ids")),
+                Err(_) => {
+                    let text = messages
+                        .iter()
+                        .map(|(r, c)| format!("{r}: {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n";
+                    tokenizer
+                        .call_method1("encode", (text,))
+                        .map_err(model_loader::py_err("encode"))?
                         .extract::<Vec<i64>>()
-                        .map_err(model_loader::py_err("chat_template ids")),
-                    Err(_) => {
-                        let text = messages
-                            .iter()
-                            .map(|(r, c)| format!("{r}: {c}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                            + "\n";
-                        tokenizer
-                            .call_method1("encode", (text,))
-                            .map_err(model_loader::py_err("encode"))?
-                            .extract::<Vec<i64>>()
-                            .map_err(model_loader::py_err("encode ids"))
-                    }
+                        .map_err(model_loader::py_err("encode ids"))
                 }
-            },
-        )
+            }
+        })
     }
 
     fn eos_token_id(&self) -> Option<i64> {
@@ -398,12 +402,8 @@ impl ModelRunner for CudaModelRunner {
                         seq_len,
                     )?;
                 } else {
-                    self.kv_cache.append_kv(
-                        layer_idx,
-                        &seq.request_id,
-                        &k_hm,
-                        &v_hm,
-                    )?;
+                    self.kv_cache
+                        .append_kv(layer_idx, &seq.request_id, &k_hm, &v_hm)?;
                 }
                 self.pool.release(k_hm);
                 self.pool.release(v_hm);
@@ -444,9 +444,7 @@ impl ModelRunner for CudaModelRunner {
                         .ctx
                         .device
                         .htod_sync_copy(&[total as i32])
-                        .map_err(|e| {
-                            ZealotError::Internal(format!("htod seq_len: {e}"))
-                        })?;
+                        .map_err(|e| ZealotError::Internal(format!("htod seq_len: {e}")))?;
                     self.attn.paged_forward(
                         dev_ptr(&q),
                         self.kv_cache.k_pool_ptr(layer_idx),
@@ -625,8 +623,7 @@ impl ModelRunner for CudaModelRunner {
             self.pool.release(hidden);
 
             // ── 4. LM Head ─────────────────────────────────────────
-            let mut logits_gpu =
-                self.pool.acquire(&self.ctx, self.weights.vocab_size)?;
+            let mut logits_gpu = self.pool.acquire(&self.ctx, self.weights.vocab_size)?;
             self.ctx.cublas.sgemm(
                 1,
                 self.weights.vocab_size as i32,
@@ -646,9 +643,7 @@ impl ModelRunner for CudaModelRunner {
             self.ctx
                 .device
                 .dtoh_sync_copy_into(&logits_gpu, &mut logits_cpu)
-                .map_err(|e| {
-                    ZealotError::Internal(format!("logits dtoh: {e}"))
-                })?;
+                .map_err(|e| ZealotError::Internal(format!("logits dtoh: {e}")))?;
             self.pool.release(logits_gpu);
 
             self.pool.flush();
@@ -667,6 +662,11 @@ impl ModelRunner for CudaModelRunner {
 /// any failure.
 fn extract_eos(tokenizer_py: Option<&Py<PyAny>>) -> Option<i64> {
     tokenizer_py.and_then(|t| {
-        Python::with_gil(|py| t.bind(py).getattr("eos_token_id").and_then(|v| v.extract()).ok())
+        Python::with_gil(|py| {
+            t.bind(py)
+                .getattr("eos_token_id")
+                .and_then(|v| v.extract())
+                .ok()
+        })
     })
 }

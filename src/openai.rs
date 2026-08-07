@@ -33,8 +33,12 @@ pub struct ChatCompletionRequest {
     pub seed: Option<u64>,
 }
 
-fn default_temperature() -> f32 { 1.0 }
-fn default_top_p() -> f32 { 1.0 }
+fn default_temperature() -> f32 {
+    1.0
+}
+fn default_top_p() -> f32 {
+    1.0
+}
 
 // ── SSE streaming chunks ───────────────────────────
 

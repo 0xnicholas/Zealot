@@ -73,7 +73,10 @@ impl Model {
     }
 
     fn allocated_count(&self) -> usize {
-        self.blocks.iter().filter(|s| !matches!(s, ModelState::Free { .. })).count()
+        self.blocks
+            .iter()
+            .filter(|s| !matches!(s, ModelState::Free { .. }))
+            .count()
     }
 
     fn allocate(&mut self) -> Option<usize> {
@@ -94,7 +97,10 @@ impl Model {
         let block = &mut self.blocks[h.block_id];
         match block {
             ModelState::Free { .. } => Err(()),
-            ModelState::Allocated { refcount, generation } => {
+            ModelState::Allocated {
+                refcount,
+                generation,
+            } => {
                 if *generation != h.generation {
                     return Err(());
                 }
@@ -116,7 +122,10 @@ impl Model {
     fn reference(&mut self, h: &BlockHandle) -> Result<(), ()> {
         match &mut self.blocks[h.block_id] {
             ModelState::Free { .. } => Err(()),
-            ModelState::Allocated { refcount, generation } => {
+            ModelState::Allocated {
+                refcount,
+                generation,
+            } => {
                 if *generation != h.generation {
                     return Err(());
                 }
@@ -216,7 +225,10 @@ fn run_sequence(num_blocks: usize, ops: &[Op]) {
                 ModelState::Free { .. } => 0,
             })
             .sum();
-        assert_eq!(held_refs, model_refs, "引用守恒：held_refs != 模型 refcount 总和");
+        assert_eq!(
+            held_refs, model_refs,
+            "引用守恒：held_refs != 模型 refcount 总和"
+        );
     }
 
     // 终局不变量：模型空闲数 == 真实空闲数（无泄漏 / 无重复入池）

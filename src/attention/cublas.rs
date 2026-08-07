@@ -87,16 +87,26 @@ impl CublasContext {
         let beta: f32 = 0.0;
         let status = unsafe {
             cublasSgemm_v2(
-                self.handle, trans_a, trans_b, m, n, k, &alpha,
-                a, lda, b, ldb, &beta, c, ldc,
+                self.handle,
+                trans_a,
+                trans_b,
+                m,
+                n,
+                k,
+                &alpha,
+                a,
+                lda,
+                b,
+                ldb,
+                &beta,
+                c,
+                ldc,
             )
         };
         if status != CublasStatus::Success {
             let msg = unsafe {
                 let ptr = cublasGetErrorString(status);
-                std::ffi::CStr::from_ptr(ptr)
-                    .to_string_lossy()
-                    .into_owned()
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
             };
             return Err(ZealotError::Internal(format!("cublasSgemm: {msg}")));
         }

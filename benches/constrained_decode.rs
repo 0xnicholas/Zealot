@@ -54,5 +54,9 @@ fn bench_decode_schema_reject(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_decode_schema_simple, bench_decode_schema_reject);
+criterion_group!(
+    benches,
+    bench_decode_schema_simple,
+    bench_decode_schema_reject
+);
 criterion_main!(benches);

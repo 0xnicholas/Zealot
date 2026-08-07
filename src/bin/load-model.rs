@@ -13,7 +13,8 @@ use runtime_v1::LoadModelRequest;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("GRPC_ADDR").unwrap_or_else(|_| "http://127.0.0.1:9091".into());
-    let model = std::env::var("MODEL").unwrap_or_else(|_| "hf-internal-testing/tiny-random-gpt2".into());
+    let model =
+        std::env::var("MODEL").unwrap_or_else(|_| "hf-internal-testing/tiny-random-gpt2".into());
 
     let mut client = InferenceRuntimeClient::connect(addr).await?;
     println!("Loading model: {model}...");
@@ -28,6 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await??;
 
     let inner = resp.into_inner();
-    println!("LoadModel response: ready={}, message={}", inner.ready, inner.message);
+    println!(
+        "LoadModel response: ready={}, message={}",
+        inner.ready, inner.message
+    );
     Ok(())
 }

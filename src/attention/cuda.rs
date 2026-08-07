@@ -35,7 +35,12 @@ impl CudaAttention {
         gqa_kernel: CudaFunction,
         device: Arc<CudaDevice>,
     ) -> Self {
-        Self { kernel, paged_kernel, gqa_kernel, dev: device }
+        Self {
+            kernel,
+            paged_kernel,
+            gqa_kernel,
+            dev: device,
+        }
     }
 
     /// Launch the flash-attention kernel on the device's default stream.
@@ -65,8 +70,7 @@ impl CudaAttention {
         let br = if head_dim > 128 { 32 } else { 64 };
         let bc = br;
         let grid_y = seq_len.div_ceil(br) as u32;
-        let shared_mem_bytes: u32 =
-            ((br * head_dim + bc * head_dim * 2 + br * bc) * 4) as u32;
+        let shared_mem_bytes: u32 = ((br * head_dim + bc * head_dim * 2 + br * bc) * 4) as u32;
 
         let cfg = LaunchConfig {
             grid_dim: (num_heads as u32, grid_y, 1),
@@ -147,17 +151,29 @@ impl CudaAttention {
         let (kernel_to_use, grid_dim, shared_mem) = if num_heads == num_kv_heads {
             // MHA: existing kernel, grid = (num_seqs, num_heads)
             let smem = (block_size * head_dim * 2 * std::mem::size_of::<f32>()) as u32;
-            (&self.paged_kernel, (num_seqs as u32, num_heads as u32, 1), smem)
+            (
+                &self.paged_kernel,
+                (num_seqs as u32, num_heads as u32, 1),
+                smem,
+            )
         } else if heads_per_kv <= 8 {
             // GQA: shared kernel, grid = (num_seqs, num_kv_heads)
             // Shared memory: K + V tiles + O accumulators (heads_per_kv * head_dim)
             let smem = ((block_size * head_dim * 2 + heads_per_kv * head_dim)
                 * std::mem::size_of::<f32>()) as u32;
-            (&self.gqa_kernel, (num_seqs as u32, num_kv_heads as u32, 1), smem)
+            (
+                &self.gqa_kernel,
+                (num_seqs as u32, num_kv_heads as u32, 1),
+                smem,
+            )
         } else {
             // Fallback: use MHA kernel (duplicated K/V loads per head)
             let smem = (block_size * head_dim * 2 * std::mem::size_of::<f32>()) as u32;
-            (&self.paged_kernel, (num_seqs as u32, num_heads as u32, 1), smem)
+            (
+                &self.paged_kernel,
+                (num_seqs as u32, num_heads as u32, 1),
+                smem,
+            )
         };
 
         let cfg = LaunchConfig {

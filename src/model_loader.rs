@@ -10,9 +10,9 @@ pub struct LayerWeights {
     pub attn_proj: Vec<f32>,
     pub rms_attn_weight: Vec<f32>,
     pub rms_ffn_weight: Vec<f32>,
-    pub gate_proj: Vec<f32>,   // [hidden_dim, intermediate_dim]
-    pub up_proj: Vec<f32>,     // [hidden_dim, intermediate_dim]
-    pub down_proj: Vec<f32>,   // [intermediate_dim, hidden_dim]
+    pub gate_proj: Vec<f32>, // [hidden_dim, intermediate_dim]
+    pub up_proj: Vec<f32>,   // [hidden_dim, intermediate_dim]
+    pub down_proj: Vec<f32>, // [intermediate_dim, hidden_dim]
 }
 
 /// Weight and metadata extracted from a HuggingFace model via PyO3.
@@ -93,9 +93,7 @@ pub fn get_attr_chain<'py>(
 }
 
 /// Get the first layer (index 0) from the model's transformer block.
-pub fn get_first_layer<'py>(
-    model: &Bound<'py, PyAny>,
-) -> Result<Bound<'py, PyAny>, ZealotError> {
+pub fn get_first_layer<'py>(model: &Bound<'py, PyAny>) -> Result<Bound<'py, PyAny>, ZealotError> {
     let container = get_attr_chain(
         model,
         &[&["transformer", "h"], &["model", "layers"]],
@@ -209,13 +207,10 @@ pub fn load_weights(model_id: &str) -> Result<ModelWeights, ZealotError> {
         let down_proj = extract_weight(&first_layer, mlp_chains, "down_proj", "down_proj")?;
 
         // ── RMS norm weights ──────────────────────────────────────────
-        let rms_attn_chains: &[&[&str]] =
-            &[&["input_layernorm"], &["attention_norm"], &["ln_1"]];
-        let rms_ffn_chains: &[&[&str]] =
-            &[&["post_attention_layernorm"], &["ffn_norm"], &["ln_2"]];
+        let rms_attn_chains: &[&[&str]] = &[&["input_layernorm"], &["attention_norm"], &["ln_1"]];
+        let rms_ffn_chains: &[&[&str]] = &[&["post_attention_layernorm"], &["ffn_norm"], &["ln_2"]];
 
-        let rms_attn_weight =
-            extract_direct_weight(&first_layer, rms_attn_chains, "rms_attn")?;
+        let rms_attn_weight = extract_direct_weight(&first_layer, rms_attn_chains, "rms_attn")?;
         let rms_ffn_weight = extract_direct_weight(&first_layer, rms_ffn_chains, "rms_ffn")
             .unwrap_or_else(|_| rms_attn_weight.clone());
 
@@ -347,10 +342,8 @@ pub fn load_weights_all_layers(model_id: &str) -> Result<ModelWeights, ZealotErr
         )?;
 
         let attn_chains: &[&[&str]] = &[&["attn"], &["self_attn"], &["attention"]];
-        let rms_attn_chains: &[&[&str]] =
-            &[&["input_layernorm"], &["attention_norm"], &["ln_1"]];
-        let rms_ffn_chains: &[&[&str]] =
-            &[&["post_attention_layernorm"], &["ffn_norm"], &["ln_2"]];
+        let rms_attn_chains: &[&[&str]] = &[&["input_layernorm"], &["attention_norm"], &["ln_1"]];
+        let rms_ffn_chains: &[&[&str]] = &[&["post_attention_layernorm"], &["ffn_norm"], &["ln_2"]];
 
         let mut layers = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
@@ -358,22 +351,38 @@ pub fn load_weights_all_layers(model_id: &str) -> Result<ModelWeights, ZealotErr
                 .get_item(i)
                 .map_err(py_err(&format!("layers[{i}]")))?;
 
-            let q_proj = extract_weight(&layer, attn_chains, "q_proj", &format!("layer[{i}].q_proj"))?;
-            let k_proj = extract_weight(&layer, attn_chains, "k_proj", &format!("layer[{i}].k_proj"))?;
-            let v_proj = extract_weight(&layer, attn_chains, "v_proj", &format!("layer[{i}].v_proj"))?;
+            let q_proj =
+                extract_weight(&layer, attn_chains, "q_proj", &format!("layer[{i}].q_proj"))?;
+            let k_proj =
+                extract_weight(&layer, attn_chains, "k_proj", &format!("layer[{i}].k_proj"))?;
+            let v_proj =
+                extract_weight(&layer, attn_chains, "v_proj", &format!("layer[{i}].v_proj"))?;
             let attn_proj =
                 extract_weight(&layer, attn_chains, "o_proj", &format!("layer[{i}].o_proj"))?;
-            let rms_attn_weight = extract_direct_weight(
-                &layer,
-                rms_attn_chains,
-                &format!("layer[{i}].rms_attn"),
-            )?;
-            let rms_ffn_weight = extract_direct_weight(&layer, rms_ffn_chains, &format!("layer[{i}].rms_ffn"))
-                .unwrap_or_else(|_| rms_attn_weight.clone());
+            let rms_attn_weight =
+                extract_direct_weight(&layer, rms_attn_chains, &format!("layer[{i}].rms_attn"))?;
+            let rms_ffn_weight =
+                extract_direct_weight(&layer, rms_ffn_chains, &format!("layer[{i}].rms_ffn"))
+                    .unwrap_or_else(|_| rms_attn_weight.clone());
             let mlp_chains: &[&[&str]] = &[&["mlp"]];
-            let gate_proj = extract_weight(&layer, mlp_chains, "gate_proj", &format!("layer[{i}].gate_proj"))?;
-            let up_proj = extract_weight(&layer, mlp_chains, "up_proj", &format!("layer[{i}].up_proj"))?;
-            let down_proj = extract_weight(&layer, mlp_chains, "down_proj", &format!("layer[{i}].down_proj"))?;
+            let gate_proj = extract_weight(
+                &layer,
+                mlp_chains,
+                "gate_proj",
+                &format!("layer[{i}].gate_proj"),
+            )?;
+            let up_proj = extract_weight(
+                &layer,
+                mlp_chains,
+                "up_proj",
+                &format!("layer[{i}].up_proj"),
+            )?;
+            let down_proj = extract_weight(
+                &layer,
+                mlp_chains,
+                "down_proj",
+                &format!("layer[{i}].down_proj"),
+            )?;
 
             layers.push(LayerWeights {
                 q_proj,

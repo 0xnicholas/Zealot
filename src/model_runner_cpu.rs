@@ -64,26 +64,28 @@ impl CpuModelRunner {
         let tokenizer_py = Python::with_gil(|py| -> Option<Py<PyAny>> {
             if let Ok(sp) = std::env::var("ZEALOT_SITE_PACKAGES") {
                 let sys = py.import("sys").ok()?;
-                sys.getattr("path").ok()?
-                    .call_method1("insert", (0, sp)).ok()?;
+                sys.getattr("path")
+                    .ok()?
+                    .call_method1("insert", (0, sp))
+                    .ok()?;
             }
             let transformers = py.import("transformers").ok()?;
             let tokenizer = transformers
-                .getattr("AutoTokenizer").ok()?
-                .call_method1("from_pretrained", (model_id,)).ok()?;
+                .getattr("AutoTokenizer")
+                .ok()?
+                .call_method1("from_pretrained", (model_id,))
+                .ok()?;
             Some(tokenizer.unbind())
         });
 
-        let eos_token_id: Option<i64> = tokenizer_py
-            .as_ref()
-            .and_then(|t| {
-                Python::with_gil(|py| {
-                    t.bind(py)
-                        .getattr("eos_token_id")
-                        .and_then(|v| v.extract())
-                        .ok()
-                })
-            });
+        let eos_token_id: Option<i64> = tokenizer_py.as_ref().and_then(|t| {
+            Python::with_gil(|py| {
+                t.bind(py)
+                    .getattr("eos_token_id")
+                    .and_then(|v| v.extract())
+                    .ok()
+            })
+        });
 
         Ok(Self {
             attn: Box::new(CpuAttention),
@@ -130,8 +132,7 @@ impl ModelRunner for CpuModelRunner {
                     .map_err(model_loader::py_err("msg role"))?;
                 d.set_item("content", content)
                     .map_err(model_loader::py_err("msg content"))?;
-                list.append(d)
-                    .map_err(model_loader::py_err("msg append"))?;
+                list.append(d).map_err(model_loader::py_err("msg append"))?;
             }
             let kwargs = PyDict::new(py);
             kwargs

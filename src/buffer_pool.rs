@@ -36,11 +36,7 @@ impl BufferPool {
     ///
     /// Returns a cached buffer if one exists for `n`; otherwise allocates
     /// a new zero-filled slice via `ctx`.
-    pub fn acquire(
-        &mut self,
-        ctx: &GpuContext,
-        n: usize,
-    ) -> Result<CudaSlice<f32>, ZealotError> {
+    pub fn acquire(&mut self, ctx: &GpuContext, n: usize) -> Result<CudaSlice<f32>, ZealotError> {
         if let Some(bucket) = self.free_buffers.get_mut(&n) {
             if let Some(buf) = bucket.pop() {
                 return Ok(buf);

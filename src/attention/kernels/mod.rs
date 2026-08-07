@@ -1,9 +1,9 @@
 // zealot/src/attention/kernels/mod.rs
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaFunction, DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
-#[cfg(feature = "cuda")]
 use crate::error::ZealotError;
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaFunction, DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
 
 #[cfg(feature = "cuda")]
 static ATTENTION_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/attention.ptx"));

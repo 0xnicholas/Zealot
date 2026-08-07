@@ -4,10 +4,10 @@ use pyo3::prelude::*;
 // 运行：ZEALOT_LOOM=1 cargo test --lib loom -- --test-threads=1
 #[cfg(loom)]
 use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-#[cfg(not(loom))]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(loom)]
 use loom::sync::Mutex;
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 use std::sync::Mutex;
 
@@ -309,9 +309,8 @@ mod loom_tests {
             const ITERS: usize = 3;
 
             let bm = Arc::new(BlockManager::create(BLOCKS, 16).unwrap());
-            let in_use: Arc<Vec<AtomicBool>> = Arc::new(
-                (0..BLOCKS).map(|_| AtomicBool::new(false)).collect(),
-            );
+            let in_use: Arc<Vec<AtomicBool>> =
+                Arc::new((0..BLOCKS).map(|_| AtomicBool::new(false)).collect());
 
             let threads: Vec<_> = (0..THREADS)
                 .map(|_| {
@@ -324,11 +323,7 @@ mod loom_tests {
                                 Err(_) => continue, // 池被其他线程耗尽
                             };
                             let prev = in_use[h.block_id].swap(true, Ordering::AcqRel);
-                            assert!(
-                                !prev,
-                                "block {} 被两个线程同时持有（双重分配）",
-                                h.block_id
-                            );
+                            assert!(!prev, "block {} 被两个线程同时持有（双重分配）", h.block_id);
                             // ... 模拟使用 block ...
                             // 先清标记再 free：free 后 block 可被他人分配，
                             // 标记须在此之前清除，否则新持有者的 swap 会误报。
@@ -363,9 +358,8 @@ mod loom_tests {
             const BLOCKS: usize = 2;
 
             let bm = Arc::new(BlockManager::create(BLOCKS, 16).unwrap());
-            let in_use: Arc<Vec<AtomicBool>> = Arc::new(
-                (0..BLOCKS).map(|_| AtomicBool::new(false)).collect(),
-            );
+            let in_use: Arc<Vec<AtomicBool>> =
+                Arc::new((0..BLOCKS).map(|_| AtomicBool::new(false)).collect());
 
             let user = {
                 let bm = bm.clone();
@@ -448,10 +442,7 @@ mod loom_tests {
             b.join().unwrap();
 
             if let Some(result) = stale_result {
-                assert!(
-                    result.is_err(),
-                    "过期 handle 必须返回 StaleHandle"
-                );
+                assert!(result.is_err(), "过期 handle 必须返回 StaleHandle");
             }
             assert_eq!(bm.available(), 1);
         });
@@ -557,4 +548,3 @@ mod loom_tests {
         });
     }
 }
-
