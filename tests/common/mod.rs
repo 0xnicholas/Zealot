@@ -20,9 +20,8 @@ impl Drop for ChildGuard {
     }
 }
 
-/// 以端口 0 拉起 zealot-backend，返回实际监听地址。
-/// 子进程继承父进程环境（含 ZEALOT_SITE_PACKAGES）。
-pub async fn spawn_backend() -> (ChildGuard, String) {
+/// 以端口 0 拉起 zealot-backend，返回 (guard, gRPC 地址, HTTP 地址)。
+pub async fn spawn_backend_full() -> (ChildGuard, String, String) {
     let exe = env!("CARGO_BIN_EXE_zealot-backend");
     let mut child = Command::new(exe)
         .env("ZEALOT_GRPC_PORT", "0")
@@ -44,12 +43,21 @@ pub async fn spawn_backend() -> (ChildGuard, String) {
     let rest = line
         .strip_prefix("zealot-backend listening on ")
         .expect("listen address line");
-    let grpc_addr = rest
-        .split(" (gRPC)")
+    let mut parts = rest.splitn(2, " (gRPC) ");
+    let grpc_addr = parts.next().unwrap_or(rest).replace("0.0.0.0", "127.0.0.1");
+    let http_addr = parts
         .next()
-        .unwrap_or(rest)
+        .unwrap_or("")
+        .strip_suffix(" (HTTP)")
+        .unwrap_or("")
         .replace("0.0.0.0", "127.0.0.1");
-    (ChildGuard(child), grpc_addr)
+    (ChildGuard(child), grpc_addr, http_addr)
+}
+
+/// 仅 gRPC 地址的旧版入口（大部分 backend_e2e 用）。
+pub async fn spawn_backend() -> (ChildGuard, String) {
+    let (guard, grpc, _http) = spawn_backend_full().await;
+    (guard, grpc)
 }
 
 pub fn stream_start(request_id: &str, model: &str) -> InferRequest {

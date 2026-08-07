@@ -199,6 +199,12 @@ impl ByteAutomaton {
         let out = b.compile_value(gt)?;
         for &e in &out.exits {
             debug_assert!(b.states[e].is_final, "exit state must be final");
+            // M5-④：根出口剥离 token 间空白——收尾后只允许 EOS（引擎侧强制放行），
+            // 避免 ws 自循环把序列拖到 Length。嵌套值出口的 ws（Ġ, / Ġ} 承接）
+            // 由 compile_value 统一添加，不受影响。
+            for &w in &WS_BYTES {
+                b.clear_stay(e, w);
+            }
         }
         // 重编号：start → 0（其余按序移位），统一起始状态约定
         let n = b.states.len();
@@ -315,6 +321,10 @@ impl AutoBuilder {
 
     fn add_stay(&mut self, s: usize, b: u8) {
         self.states[s].stay[(b >> 3) as usize] |= 1 << (b & 7);
+    }
+
+    fn clear_stay(&mut self, s: usize, b: u8) {
+        self.states[s].stay[(b >> 3) as usize] &= !(1 << (b & 7));
     }
 
     fn add_stay_range(&mut self, s: usize, lo: u8, hi: u8) {
@@ -534,14 +544,22 @@ impl AutoBuilder {
         let mut trie_root: Vec<usize> = vec![0; r + 1];
         let mut key_root: Vec<usize> = vec![0; r + 1];
         for k in (0..=r).rev() {
-            // 键 trie(k)：`"` → 键字节链 → after_key(k,name) → `:` → 值(k,name)
+            // 键 trie(k)：`"` → 键字节链 → after_key(k,name) → `:` → 值(k,name)。
+            // strict 语义（M5-④）：已满足的 required 键 req[0..k] 从后续位置排除
+            // （required 键唯一）——否则重复 required 键使计数器 k 永不推进，
+            // 贪心采样陷入死循环；optional 键在所有位置保留（可重复）。
             let tr = self.new_state()?;
             self.boundary(tr);
             let kr = self.new_state()?;
             self.add_edge(tr, b'"', kr);
             trie_root[k] = tr;
             key_root[k] = kr;
-            for name in &keys {
+            let eligible: Vec<&String> = keys
+                .iter()
+                .copied()
+                .filter(|n| !req[..k].contains(n))
+                .collect();
+            for name in &eligible {
                 let leaf = self.chain_from(key_root[k], name.as_bytes())?;
                 let ak = self.new_state()?;
                 self.boundary(ak);
@@ -1081,8 +1099,13 @@ mod tests {
         );
         assert_eq!(
             walk(&g, b"{\"a\":1,\"a\":2,\"b\":true}"),
+            (false, false),
+            "重复 required 键被拒（strict 唯一性）"
+        );
+        assert_eq!(
+            walk(&g, b"{\"c\":\"x\",\"c\":\"x\",\"a\":1,\"b\":true}"),
             (true, true),
-            "重复键"
+            "optional 键可重复（c 非 required）"
         );
         // 值类型校验
         assert_eq!(
@@ -1176,6 +1199,59 @@ mod tests {
             g.advance_state(s2, 0, Some(&tok)),
             s2,
             "`{{` 后不能再来 `{{`"
+        );
+    }
+
+    #[test]
+    fn test_root_exit_has_no_ws_after_completion() {
+        // M5-④：根出口剥离 ws——收尾后 allowed 为空，引擎侧 eos 强制放行。
+        // 嵌套值出口保留 ws（`Ġ,`/`Ġ}` 承接 token）。
+        use crate::mock_runner::MOCK_TINY_VOCAB;
+        let tok = Tokenizer::from_vocab(
+            MOCK_TINY_VOCAB
+                .iter()
+                .map(|s| Some(s.to_string()))
+                .collect(),
+            true,
+        );
+        let g = object_grammar(vec![("name", GrammarType::Boolean)], vec!["name"]);
+        let mut st = 0usize;
+        for t in [9_i64, 11, 1, 11, 12, 3, 10] {
+            st = g.advance_state(st, t, Some(&tok));
+        }
+        assert!(g.is_valid_final_state(st, Some(&tok)));
+        // `\n`(14) 不再被允许（根出口 ws 已剥离）
+        assert_eq!(g.allowed_tokens_for(st, Some(&tok)), Vec::<i32>::new());
+        // 嵌套对象（值位置）的出口仍需 ws：`{"name":{"name":true}}` 走完内层
+        // 后 ws 依然被承接（此处仅验证嵌套出口状态仍带 ws 位）
+        let outer = object_grammar(
+            vec![(
+                "name",
+                GrammarType::Object {
+                    properties: {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("name".into(), GrammarType::Boolean);
+                        m
+                    },
+                    required: vec!["name".into()],
+                    additional_properties: false,
+                },
+            )],
+            vec!["name"],
+        );
+        let mut st2 = 0usize;
+        for t in [9_i64, 11, 1, 11, 12, 9, 11, 1, 11, 12, 3, 10, 10] {
+            st2 = outer.advance_state(st2, t, Some(&tok));
+        }
+        assert!(outer.is_valid_final_state(st2, Some(&tok)));
+        // 内层对象收尾（第 12 个 token，内层 done）——嵌套出口保留 ws（`\n`=14）
+        let mut st3 = 0usize;
+        for t in [9_i64, 11, 1, 11, 12, 9, 11, 1, 11, 12, 3, 10] {
+            st3 = outer.advance_state(st3, t, Some(&tok));
+        }
+        assert!(
+            outer.allowed_tokens_for(st3, Some(&tok)).contains(&14),
+            "嵌套出口保留 ws 承接 \u{0122},/\u{0122}"
         );
     }
 

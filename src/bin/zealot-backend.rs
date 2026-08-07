@@ -30,10 +30,13 @@ use futures::StreamExt;
 use tokio_stream::{wrappers::ReceiverStream, wrappers::TcpListenerStream, Stream};
 use tonic::{transport::Server, Request, Status, Streaming};
 
+use zealot_engine::constrained_decode::matcher::ConstrainedGrammar;
+use zealot_engine::constrained_decode::schema::JsonSchemaCompiler;
 #[cfg(feature = "cuda")]
 use zealot_engine::cuda_runner::CudaModelRunner;
 use zealot_engine::engine::{Engine, ModelRunner};
 use zealot_engine::error::ZealotError;
+use zealot_engine::mock_runner::MockModelRunner;
 use zealot_engine::model_runner_cpu::CpuModelRunner;
 use zealot_engine::openai::{self, ChatCompletionRequest};
 use zealot_engine::sampling::SamplingParams;
@@ -66,6 +69,9 @@ enum EngineCmd {
         max_tokens: usize,
         priority: Priority,
         sampling_params: SamplingParams,
+        /// M5-④：HTTP 链路解析出的约束 grammar（gRPC 链路为 None）。
+        /// Box：自动机体积大，避免 Infer 变体膨胀触发 large_enum_variant。
+        grammar: Option<Box<ConstrainedGrammar>>,
         tx: Tx,
     },
     Cancel {
@@ -77,6 +83,23 @@ enum EngineCmd {
 struct SlotHandle {
     cmd_tx: std::sync::mpsc::Sender<EngineCmd>,
     model: LoadedModel,
+}
+
+/// 引擎槽 + HTTP 链路共享的 schema 编译器（LRU 缓存跨请求生效）。
+#[derive(Clone)]
+struct Runtime {
+    slot: Arc<Mutex<ModelSlot>>,
+    schema_compiler: Arc<JsonSchemaCompiler>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            slot: Arc::new(Mutex::new(ModelSlot::Empty)),
+            // max_states 与自动机上限（2^18）一致；编译超 1s 拒绝（防对抗 schema）
+            schema_compiler: Arc::new(JsonSchemaCompiler::new(16, 262_144, 1_000)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -115,6 +138,7 @@ fn handle_cmd(
             max_tokens,
             priority,
             sampling_params,
+            grammar,
             tx,
         } => {
             let made = engine.runner().tokenize_chat(&messages).and_then(|ids| {
@@ -129,6 +153,11 @@ fn handle_cmd(
             });
             match made {
                 Ok(seq) => {
+                    // M5-④：HTTP 链路解析出的约束 grammar 绑定到 sequence
+                    let seq = match grammar {
+                        Some(g) => seq.with_grammar(*g),
+                        None => seq,
+                    };
                     engine.scheduler_mut().add(seq);
                     inflight.insert(request_id, tx);
                 }
@@ -217,11 +246,6 @@ fn run_engine(mut engine: Engine, eos: Option<i64>, cmd_rx: std::sync::mpsc::Rec
 
 // ── gRPC service ─────────────────────────────────────
 
-#[derive(Clone, Default)]
-struct Runtime {
-    slot: Arc<Mutex<ModelSlot>>,
-}
-
 impl Runtime {
     // tonic::Status 含动态 details 字段，Err 变体 >128B；poison 分支极少触发，
     // 保持 Result<_, Status> 签名以便 10 处 `?` 直传，scoped allow 明确记录此权衡。
@@ -295,32 +319,39 @@ impl InferenceRuntime for Runtime {
 
         let model_id = req.model_id.clone();
         // 加载是重阻塞操作（HF 下载 + CPU 读盘），移出 tokio 工作线程
-        let runner: Box<dyn ModelRunner> = match tokio::task::spawn_blocking(
-            move || -> Result<Box<dyn ModelRunner>, ZealotError> {
-                #[cfg(feature = "cuda")]
-                {
-                    match CudaModelRunner::load(&model_id, 0) {
-                        Ok(r) => return Ok(Box::new(r)),
-                        Err(e) => {
-                            tracing::warn!("GPU runner unavailable, falling back to CPU: {e}");
+        // （M5-④：mock: 前缀走确定性 dev runner，附内置 byte 词表 tokenizer）
+        let (runner, mock_tok): (Box<dyn ModelRunner>, Option<Tokenizer>) =
+            match tokio::task::spawn_blocking(
+                move || -> Result<(Box<dyn ModelRunner>, Option<Tokenizer>), ZealotError> {
+                    if model_id.starts_with("mock:") {
+                        let runner = MockModelRunner::load(&model_id)?;
+                        let tok = runner.tokenizer();
+                        return Ok((Box::new(runner), Some(tok)));
+                    }
+                    #[cfg(feature = "cuda")]
+                    {
+                        match CudaModelRunner::load(&model_id, 0) {
+                            Ok(r) => return Ok((Box::new(r), None)),
+                            Err(e) => {
+                                tracing::warn!("GPU runner unavailable, falling back to CPU: {e}");
+                            }
                         }
                     }
+                    Ok((Box::new(CpuModelRunner::load(&model_id)?), None))
+                },
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    *self.lock_slot()? = ModelSlot::Empty;
+                    return Err(Status::internal(format!("model load failed: {e}")));
                 }
-                Ok(Box::new(CpuModelRunner::load(&model_id)?))
-            },
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                *self.lock_slot()? = ModelSlot::Empty;
-                return Err(Status::internal(format!("model load failed: {e}")));
-            }
-            Err(e) => {
-                *self.lock_slot()? = ModelSlot::Empty;
-                return Err(Status::internal(format!("load task failed: {e}")));
-            }
-        };
+                Err(e) => {
+                    *self.lock_slot()? = ModelSlot::Empty;
+                    return Err(Status::internal(format!("load task failed: {e}")));
+                }
+            };
 
         let eos = runner.eos_token_id();
         let sched = Scheduler::new(SchedulerConfig::default())
@@ -328,6 +359,9 @@ impl InferenceRuntime for Runtime {
         let mut engine = Engine::new(sched, runner);
         // Try to load tokenizer.json from model cache for Rust-side decoding
         if let Ok(tok) = Tokenizer::load(&req.model_id) {
+            engine = engine.with_tokenizer(tok);
+        } else if let Some(tok) = mock_tok {
+            // dev mock：附加内置 byte 词表（vocab-mode 真实 token 校验）
             engine = engine.with_tokenizer(tok);
         }
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
@@ -454,6 +488,8 @@ impl InferenceRuntime for Runtime {
                 max_tokens,
                 priority,
                 sampling_params: sampling,
+                // gRPC 链路暂不携带 grammar（后续里程碑）
+                grammar: None,
                 tx,
             })
             .map_err(|_| Status::internal("engine thread gone"))?;
@@ -632,6 +668,30 @@ async fn handle_openai_chat(
         seed: body.seed,
     };
 
+    // M5-④：response_format / tools / tool_choice → 约束 grammar（编译失败 400）
+    let grammar = match openai::resolve_grammar(
+        &backend.schema_compiler,
+        body.response_format.as_ref(),
+        body.tools.as_deref(),
+        body.tool_choice.as_ref(),
+    ) {
+        Ok(g) => g.map(Box::new),
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": msg,
+                        "type": "invalid_request_error",
+                        "param": null,
+                        "code": null,
+                    }
+                })),
+            )
+                .into_response()
+        }
+    };
+
     let (tx, rx) = tokio::sync::mpsc::channel(64);
     if cmd_tx
         .send(EngineCmd::Infer {
@@ -640,6 +700,7 @@ async fn handle_openai_chat(
             max_tokens,
             priority: Priority::Medium,
             sampling_params,
+            grammar,
             tx,
         })
         .is_err()

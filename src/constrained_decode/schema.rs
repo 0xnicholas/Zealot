@@ -69,8 +69,28 @@ impl JsonSchemaCompiler {
         schema_str: &str,
         bypass_cache: Option<bool>,
     ) -> PyResult<ConstrainedGrammar> {
+        self.compile_str(schema_str, bypass_cache.unwrap_or(false))
+            .map_err(|e| e.into())
+    }
+}
+
+impl JsonSchemaCompiler {
+    /// Rust 侧入口（M5-④ HTTP 链路）：直接从 `serde_json::Value` 编译。
+    /// 与 `compile` 共享缓存 / 计时 / 上限检查；缓存键为规范化序列化串
+    /// （serde_json 默认 Map 排序，序列化确定性）。
+    pub fn compile_value(&self, schema: &JsonValue) -> Result<ConstrainedGrammar, ZealotError> {
+        let schema_str = serde_json::to_string(schema)
+            .map_err(|e| ZealotError::SchemaCompileError(format!("Invalid JSON schema: {e}")))?;
+        self.compile_str(&schema_str, false)
+    }
+
+    fn compile_str(
+        &self,
+        schema_str: &str,
+        bypass_cache: bool,
+    ) -> Result<ConstrainedGrammar, ZealotError> {
         let hash = schema_hash(schema_str);
-        let use_cache = !bypass_cache.unwrap_or(false) && self.cache_size > 0;
+        let use_cache = !bypass_cache && self.cache_size > 0;
 
         if use_cache {
             let mut cache = self.cache.lock().unwrap();
@@ -84,13 +104,13 @@ impl JsonSchemaCompiler {
 
         let now = std::time::Instant::now();
         let schema: JsonValue = serde_json::from_str(schema_str)
-            .map_err(|e| ZealotError::SchemaCompileError(format!("Invalid JSON schema: {}", e)))?;
+            .map_err(|e| ZealotError::SchemaCompileError(format!("Invalid JSON schema: {e}")))?;
 
         let grammar = compile_schema(&schema, self.max_states, 0)?;
 
         let elapsed = now.elapsed().as_millis() as u64;
         if elapsed > self.max_compile_ms {
-            return Err(ZealotError::SchemaCompileTimeout(self.max_compile_ms).into());
+            return Err(ZealotError::SchemaCompileTimeout(self.max_compile_ms));
         }
 
         let grammar = Arc::new(grammar);
@@ -121,11 +141,11 @@ fn compile_schema(
     schema: &JsonValue,
     max_states: usize,
     depth: usize,
-) -> PyResult<ConstrainedGrammar> {
+) -> Result<ConstrainedGrammar, ZealotError> {
     if depth > MAX_NESTING_DEPTH {
-        return Err(
-            ZealotError::SchemaCompileError("Maximum nesting depth exceeded".into()).into(),
-        );
+        return Err(ZealotError::SchemaCompileError(
+            "Maximum nesting depth exceeded".into(),
+        ));
     }
 
     let grammar_type = if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
@@ -155,8 +175,7 @@ fn compile_schema(
         return Err(ZealotError::SchemaTooComplex {
             states: grammar.state_count(),
             limit: max_states,
-        }
-        .into());
+        });
     }
     // M5-③：字节级自动机超上限（required 计数器展开/键 trie 过大）→ 整体拒绝。
     // 报错沿用 SchemaTooComplex（states 为扁平计数，limit 为用户 max_states）。
@@ -164,13 +183,16 @@ fn compile_schema(
         return Err(ZealotError::SchemaTooComplex {
             states: grammar.state_count(),
             limit: max_states,
-        }
-        .into());
+        });
     }
     Ok(grammar)
 }
 
-fn compile_string(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyResult<GrammarType> {
+fn compile_string(
+    schema: &JsonValue,
+    _max_states: usize,
+    _depth: usize,
+) -> Result<GrammarType, ZealotError> {
     let min_len = schema
         .get("minLength")
         .and_then(|v| v.as_u64())
@@ -198,7 +220,11 @@ fn compile_string(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyRe
     })
 }
 
-fn compile_enum(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyResult<GrammarType> {
+fn compile_enum(
+    schema: &JsonValue,
+    _max_states: usize,
+    _depth: usize,
+) -> Result<GrammarType, ZealotError> {
     let values = schema
         .get("enum")
         .and_then(|v| v.as_array())
@@ -208,20 +234,26 @@ fn compile_enum(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyResu
     Ok(GrammarType::Enum { values })
 }
 
-fn compile_object(schema: &JsonValue, max_states: usize, depth: usize) -> PyResult<GrammarType> {
+fn compile_object(
+    schema: &JsonValue,
+    max_states: usize,
+    depth: usize,
+) -> Result<GrammarType, ZealotError> {
     let properties = schema
         .get("properties")
         .and_then(|v| v.as_object())
-        .map(|props| -> PyResult<HashMap<String, GrammarType>> {
-            let mut prop_grammars = HashMap::new();
-            for (name, prop_schema) in props {
-                // no-silent-failures（issue #15）：子 schema 编译失败 → 整体报错，
-                // 不再 filter_map(.ok()) 静默丢弃。
-                let grammar = compile_schema(prop_schema, max_states, depth + 1)?;
-                prop_grammars.insert(name.clone(), grammar.grammar_type);
-            }
-            Ok(prop_grammars)
-        })
+        .map(
+            |props| -> Result<HashMap<String, GrammarType>, ZealotError> {
+                let mut prop_grammars = HashMap::new();
+                for (name, prop_schema) in props {
+                    // no-silent-failures（issue #15）：子 schema 编译失败 → 整体报错，
+                    // 不再 filter_map(.ok()) 静默丢弃。
+                    let grammar = compile_schema(prop_schema, max_states, depth + 1)?;
+                    prop_grammars.insert(name.clone(), grammar.grammar_type);
+                }
+                Ok(prop_grammars)
+            },
+        )
         .transpose()?
         .unwrap_or_default();
 
@@ -247,7 +279,11 @@ fn compile_object(schema: &JsonValue, max_states: usize, depth: usize) -> PyResu
     })
 }
 
-fn compile_array(schema: &JsonValue, max_states: usize, depth: usize) -> PyResult<GrammarType> {
+fn compile_array(
+    schema: &JsonValue,
+    max_states: usize,
+    depth: usize,
+) -> Result<GrammarType, ZealotError> {
     let min_items = schema.get("minItems").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let max_items = schema.get("maxItems").and_then(|v| v.as_u64());
 
@@ -263,7 +299,11 @@ fn compile_array(schema: &JsonValue, max_states: usize, depth: usize) -> PyResul
     })
 }
 
-fn compile_union(schema: &JsonValue, max_states: usize, depth: usize) -> PyResult<GrammarType> {
+fn compile_union(
+    schema: &JsonValue,
+    max_states: usize,
+    depth: usize,
+) -> Result<GrammarType, ZealotError> {
     let branches = schema
         .get("anyOf")
         .or_else(|| schema.get("oneOf"))
@@ -271,7 +311,7 @@ fn compile_union(schema: &JsonValue, max_states: usize, depth: usize) -> PyResul
         .map(|arr| {
             arr.iter()
                 .map(|s| compile_schema(s, max_states, depth + 1))
-                .collect::<PyResult<Vec<_>>>()
+                .collect::<Result<Vec<_>, ZealotError>>()
         })
         .transpose()?
         .unwrap_or_default()

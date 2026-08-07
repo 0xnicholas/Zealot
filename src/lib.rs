@@ -13,6 +13,7 @@ pub mod error;
 pub mod gpu_context;
 #[cfg(feature = "cuda")]
 pub mod kv_cache;
+pub mod mock_runner;
 pub mod model_loader;
 pub mod model_runner_cpu;
 pub mod model_runner_py;

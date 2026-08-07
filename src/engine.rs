@@ -172,13 +172,18 @@ impl Engine {
                         }
                     }
                     // EOS 门控：grammar 未达合法收尾状态时屏蔽 EOS（强制续写）；
-                    // 合法收尾后 EOS 放行（收尾）。
+                    // 合法收尾后 EOS 放行（收尾）。M5-④：真实词表下收尾状态
+                    // 的 mask 可能全空（eos 字节不属于任何允许集合）——此时
+                    // 强制放行 eos 自然终止，避免 AllTokensMasked 退化垃圾输出。
                     if let Some(eos) = seq.eos_token_id {
-                        if eos >= 0
-                            && (eos as usize) < m.len()
-                            && !g.is_valid_final_state(seq.grammar_state, self.tokenizer.as_ref())
-                        {
-                            m[eos as usize] = false;
+                        if eos >= 0 && (eos as usize) < m.len() {
+                            let final_state =
+                                g.is_valid_final_state(seq.grammar_state, self.tokenizer.as_ref());
+                            if !final_state {
+                                m[eos as usize] = false;
+                            } else if !m.iter().any(|&x| x) {
+                                m[eos as usize] = true;
+                            }
                         }
                     }
                     m
@@ -564,6 +569,52 @@ mod tests {
         assert_eq!(tokens[1], 99, "state1（可收尾）EOS 放行");
         assert_eq!(finished, vec![("g2".to_string(), FinishReason::Stop)]);
         assert_eq!(tokens.len(), 2);
+    }
+
+    // ── M5-④：mock 词表 + 收尾 eos 强制放行 ─────────────────────────────
+
+    #[test]
+    fn grammar_mock_vocab_terminates_with_eos() {
+        // mock:tiny 词表 + 常量 logits（偏好最小 id）+ grammar mask：
+        // 根出口 ws 剥离后收尾状态 mask 为空 → eos 强制放行 → 干净 Stop。
+        let runner = crate::mock_runner::MockModelRunner::load("mock:tiny").unwrap();
+        let tok = runner.tokenizer();
+        let sched = Scheduler::new(SchedulerConfig::default()).unwrap();
+        let mut engine = Engine::new(sched, Box::new(runner)).with_tokenizer(tok);
+        let mut props = std::collections::HashMap::new();
+        props.insert("name".to_string(), GrammarType::Boolean);
+        let grammar = ConstrainedGrammar::new(GrammarType::Object {
+            properties: props,
+            required: vec!["name".to_string()],
+            additional_properties: false,
+        });
+        let seq = engine
+            .scheduler_mut()
+            .make_sequence(
+                "mock".into(),
+                vec![1, 2],
+                32,
+                Priority::Medium,
+                Some(15), // eos = 空字节 token
+                SamplingParams {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .with_grammar(grammar);
+        engine.scheduler_mut().add(seq);
+
+        let mut tokens = Vec::new();
+        let mut finished = Vec::new();
+        while !engine.is_idle() {
+            let res = engine.step().unwrap();
+            tokens.extend(res.tokens.iter().map(|t| t.token));
+            finished.extend(res.finished.iter().map(|f| f.reason));
+        }
+        // { " name " : true } + eos（10, 12, 2, 12, 13, 4, 11）——新词表 id
+        assert_eq!(tokens, vec![9, 11, 1, 11, 12, 3, 10, 15]);
+        assert_eq!(finished, vec![FinishReason::Stop], "eos 强制放行后自然收尾");
     }
 
     #[test]

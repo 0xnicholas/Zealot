@@ -93,3 +93,215 @@ async fn load_failure_resets_slot() {
         .into_inner();
     assert!(list.models.is_empty());
 }
+
+// ── M5-④：HTTP 结构化输出端到端（dev mock runner，CI 可跑）──────────────
+
+use std::process::Command;
+
+/// curl POST /v1/chat/completions，返回 (HTTP 状态码, 响应体)。
+fn http_chat(http_addr: &str, body: &str) -> (String, String) {
+    let output = Command::new("curl")
+        .args([
+            "-s",
+            "-w",
+            "\n%{http_code}",
+            "-X",
+            "POST",
+            &format!("http://{http_addr}/v1/chat/completions"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            body,
+        ])
+        .output()
+        .expect("curl failed");
+    assert!(output.status.success(), "curl exit: {}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (resp, code) = stdout
+        .rsplit_once('\n')
+        .map(|(r, c)| (r.to_string(), c.trim().to_string()))
+        .unwrap_or((stdout.to_string(), "000".into()));
+    (code, resp)
+}
+
+/// 加载 mock:tiny 并返回 (guard, http_addr)。
+async fn load_mock() -> (common::ChildGuard, String) {
+    let (guard, addr, http_addr) = common::spawn_backend_full().await;
+    let mut client = InferenceRuntimeClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect");
+    let resp = client
+        .load_model(LoadModelRequest {
+            model_id: "mock:tiny".into(),
+            quantization: Quantization::Unspecified as i32,
+            gpu_count: 0,
+            gpu_type: String::new(),
+            labels: Default::default(),
+        })
+        .await
+        .expect("load mock:tiny");
+    assert!(resp.into_inner().ready);
+    (guard, http_addr)
+}
+
+#[tokio::test]
+async fn http_response_format_json_schema_constrained_output() {
+    let (_guard, http_addr) = load_mock().await;
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 32,
+            "temperature": 0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "out",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "boolean"}},
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }"#,
+    );
+    assert_eq!(code, "200", "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse response");
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    // mock logits 偏好最小合法 id → 确定性输出；严格 schema 约束 + 收尾 eos 强制放行
+    assert_eq!(content, r#"{"name":true}"#);
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn http_response_format_strict_violation_returns_400() {
+    let (_guard, http_addr) = load_mock().await;
+    // required 缺失 + additionalProperties 缺失 → strict 检查失败 → 400
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 8,
+            "temperature": 0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "bad",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "boolean"}}
+                    }
+                }
+            }
+        }"#,
+    );
+    assert_eq!(code, "400");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse error body");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    assert!(v["error"]["message"].as_str().unwrap().contains("strict"));
+}
+
+#[tokio::test]
+async fn http_response_format_invalid_schema_returns_400() {
+    let (_guard, http_addr) = load_mock().await;
+    // json_schema 缺 schema 字段 → 400
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 8,
+            "response_format": {"type": "json_schema", "json_schema": {"name": "nope"}}
+        }"#,
+    );
+    assert_eq!(code, "400", "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse error body");
+    assert!(v["error"]["message"].as_str().unwrap().contains("schema"));
+}
+
+#[tokio::test]
+async fn http_tools_forced_call_constrained_output() {
+    let (_guard, http_addr) = load_mock().await;
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "max_tokens": 64,
+            "temperature": 0,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"name": {"type": "boolean"}},
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }"#,
+    );
+    assert_eq!(code, "200", "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse response");
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    // 信封 grammar：{"name":"get_weather","arguments":{...}}
+    let parsed: serde_json::Value = serde_json::from_str(content).expect("content is JSON");
+    assert_eq!(parsed["name"], "get_weather");
+    assert!(parsed["arguments"].is_object());
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn http_tool_choice_unknown_tool_returns_400() {
+    let (_guard, http_addr) = load_mock().await;
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 8,
+            "tools": [{
+                "type": "function",
+                "function": {"name": "a", "parameters": {"type": "object", "additionalProperties": false}}
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "ghost"}}
+        }"#,
+    );
+    assert_eq!(code, "400");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse error body");
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown tool"));
+}
+
+#[tokio::test]
+async fn http_json_object_without_schema_is_unconstrained() {
+    let (_guard, http_addr) = load_mock().await;
+    // json_object（无 schema）→ 不约束（通配键 Phase 3）→ mock 恒定 argmax `get_weather`
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 4,
+            "temperature": 0,
+            "response_format": {"type": "json_object"}
+        }"#,
+    );
+    assert_eq!(code, "200", "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse response");
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    assert_eq!(content, "get_weatherget_weatherget_weatherget_weather");
+    assert_eq!(v["choices"][0]["finish_reason"], "length");
+}

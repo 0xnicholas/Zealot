@@ -7,6 +7,18 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-④：openai.rs response_format / tools 接入（issue #18）——ChatCompletionRequest
+  新增 `response_format`（text/json_object/json_schema）与 `tools`/`tool_choice`；
+  json_schema 经 CD 编译链路约束解码（strict 校验：根 object、全属性 required、
+  `additionalProperties:false` 递归检查，失败 400）；强制 tool_choice（具名/required）
+  编译工具信封 grammar（`{"name":<枚举>,"arguments":<参数 schema>}`，参数同样
+  strict 校验，多工具 anyOf 并集）；json_object/auto/none 不约束（通配键 Phase 3）；
+  schema.rs 新增 Rust 侧 compile_value（共享 LRU 缓存/计时/上限）；引擎收尾状态
+  mask 为空时强制放行 eos（真实词表下 done 状态自然终止，杜绝 AllTokensMasked
+  退化垃圾）；自动机 strict 语义——已满足的 required 键从后续键 trie 排除（required
+  键唯一）、根出口剥离 token 间空白（嵌套值出口保留，承接 `Ġ,`/`Ġ}`）；dev mock
+  runner（`mock:tiny` 固定 byte 词表 + 常量 logits，CI 无模型环境跑 HTTP 端到端）；
+  错误面：schema 缺失/编译失败/未知工具/组合冲突 → OpenAI 风格 400
 - M5-③：matcher 真实 token 级校验（issue #17）——GrammarType 编译为字节级
   自动机（stay 位集 + 边表 + final 标记，start 恒为 0）；`allowed_tokens` 按真实
   词表（Tokenizer::token_bytes）过滤、`advance` 按 token 字节真实映射状态；
