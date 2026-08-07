@@ -330,6 +330,76 @@ async fn http_tools_conflicting_range_returns_400() {
 }
 
 #[tokio::test]
+async fn http_tools_string_minmax_length_param() {
+    // M5-⑥：工具参数 string minLength/maxLength 端到端执行（mock 恒定 argmax）。
+    // 词表 id 序：get_weather(0)/name(1)/arguments(2)/true(3)/false(4)/age(5)/1(6)/0(7)/xxx(8)/{(9)/}(10)/"(11)。
+    // 值位（minLength 5, maxLength 7）："name"(4)<5 不可收尾 → 续 "age" → 7 == max
+    // （再续任意字节 > 7 被 mask）→ 只能收尾 → "nameage"。
+    let (_guard, http_addr) = load_mock().await;
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "nm"}],
+            "max_tokens": 64,
+            "temperature": 0,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string", "minLength": 5, "maxLength": 7}},
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }"#,
+    );
+    assert_eq!(code, "200", "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse response");
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(content).expect("content is JSON");
+    assert_eq!(parsed["name"], "get_weather");
+    // min 门控 + max 封顶：贪婪产出 7 字符 "nameage"（5 ≤ len ≤ 7）
+    assert_eq!(parsed["arguments"]["name"], "nameage");
+    assert_eq!(v["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn http_string_length_conflict_returns_400() {
+    // M5-⑥：minLength > maxLength → 400
+    let (_guard, http_addr) = load_mock().await;
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{
+            "model": "mock:tiny",
+            "messages": [{"role": "user", "content": "x"}],
+            "max_tokens": 64,
+            "temperature": 0,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string", "minLength": 9, "maxLength": 2}},
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        }"#,
+    );
+    assert_eq!(code, "400", "body: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse response");
+    assert!(v["error"]["message"].as_str().unwrap().contains("空区间"));
+}
+
+#[tokio::test]
 async fn http_tool_choice_unknown_tool_returns_400() {
     let (_guard, http_addr) = load_mock().await;
     let (code, body) = http_chat(

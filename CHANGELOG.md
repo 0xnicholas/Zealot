@@ -7,6 +7,15 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-⑥：string minLength/maxLength 执行（issue #20）——长度计数自动机：
+  content_k/esc_k/u1..u4_k（k = 已消费码点数）；码点计数（ASCII/首字节 +1、
+  UTF-8 连续字节不计、`\x` 转义 +1、`\uXXXX` +1 且严格 hex 链，代理对按 2 计
+  ——文档化偏差）；min 门控收尾 `"`（k ≥ min），max 封顶（k == max 仅可收尾，
+  不可再续）；仅 min 时 k == min 冻结为吸收态（任意续写不再计数）；无约束
+  （min=0 且无 max）保持紧凑形态零开销；空区间（min > max）/超大上限
+  （horizon > 32768）→ 显式编译错误；转义/内容边整块构建避免 O(n²)；
+  pattern 组合（长度照常生效，pattern 执行随 #22）；工具参数长度约束端到端
+  生效（mock HTTP e2e：minLength 5/maxLength 7 → `"nameage"`）
 - M5-⑤：整数数值范围关键字执行（issue #19）——`GrammarType::Integer` 结构化
   （修死代码：integer 与 number 分离，integer 不再接受小数点/指数）；schema 解析
   `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`/`multipleOf`（draft-7

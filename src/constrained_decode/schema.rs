@@ -659,6 +659,36 @@ mod tests {
     }
 
     #[test]
+    fn test_string_length_ranges_error() {
+        // M5-⑥：minLength > maxLength → 空区间；超大 horizon → 显式错误
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        let err = compiler
+            .compile(
+                r#"{"type": "string", "minLength": 5, "maxLength": 2}"#,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("空区间"), "{err}");
+        let err = compiler
+            .compile(r#"{"type": "string", "maxLength": 99999999}"#, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("过大"), "{err}");
+    }
+
+    #[test]
+    fn test_string_lengths_compile_and_state_count() {
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        let g = compiler
+            .compile(
+                r#"{"type": "string", "minLength": 2, "maxLength": 4}"#,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(g.grammar_type, GrammarType::String { .. }));
+        assert!(!g.automaton_rejected());
+    }
+
+    #[test]
     fn test_integer_oversize_multiple_of_error() {
         // 区间 + 大 multipleOf → 状态预算超限 → 编译错误
         let compiler = JsonSchemaCompiler::new(16, 10000, 500);

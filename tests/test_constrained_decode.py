@@ -196,8 +196,10 @@ def test_adversarial_schema_rejected_over_max_states():
 
 
 def test_boundary_schema_accepted_at_max_states():
-    """恰好等于 max_states 的 schema 必须被接受（边界语义）。"""
-    c = make_compiler(max_states=10_000)
+    """恰好等于 max_states 的 schema 必须被接受（边界语义）。
+    9999 属性编译约 0.9s（贴 1000ms 守卫线，冷启动抖动会超时）——
+    此处放宽编译时限，只验证边界语义本身。"""
+    c = make_compiler(max_states=10_000, max_compile_ms=3_000)
     props = {f"p{i}": {"type": "string"} for i in range(9_999)}  # 10000 states
     schema = {"type": "object", "properties": props}
     g = c.compile(json.dumps(schema))
@@ -269,3 +271,44 @@ def test_integer_range_walk_with_vocab(tmp_path):
     assert not walk_ok(g, "-1"), "低于下限应被拒"
     assert not walk_ok(g, "101"), "超出上限应被拒"
     assert not walk_ok(g, "007"), "前导零应被拒"
+
+
+def test_string_length_walk_with_vocab(tmp_path):
+    """M5-⑥：minLength/maxLength 计数执行（码点）——真实词表 walk。"""
+    vocab = {chr(i): i for i in range(256)}
+    tok_path = tmp_path / "tokenizer.json"
+    tok_path.write_text(json.dumps({"model": {"type": "BPE", "vocab": vocab}}))
+
+    c = make_compiler()
+
+    def check(schema, ok_list, bad_list):
+        g = c.compile(json.dumps(schema))
+        g.load_tokenizer(str(tok_path))
+
+        def walk_ok(gs, text):
+            st = 0
+            for b in text.encode("utf-8"):  # 逐字节（码点计数由自动机处理）
+                if b not in gs.allowed_tokens(st):
+                    return False
+                st = gs.advance(st, b)
+            return gs.is_valid_final(st)
+
+        for t in ok_list:
+            assert walk_ok(g, t), f"{schema} 应接受 {t!r}"
+        for t in bad_list:
+            assert not walk_ok(g, t), f"{schema} 应拒绝 {t!r}"
+
+    check({"type": "string", "minLength": 3}, ['"abc"', '"abcd"'], ['"ab"', '""'])
+    check({"type": "string", "maxLength": 2}, ['""', '"ab"'], ['"abc"'])
+    check({"type": "string", "minLength": 2, "maxLength": 4}, ['"ab"', '"abcd"'], ['"a"', '"abcde"'])
+    # 码点计数：中（3 字节）算 1
+    check({"type": "string", "minLength": 2}, ['"\u4e2d\u4e2d"'], ['"\u4e2d"'])
+
+
+def test_string_length_invalid_ranges_rejected():
+    """M5-⑥：minLength > maxLength / 超大上限 → 显式错误。"""
+    c = make_compiler()
+    with pytest.raises(RuntimeError, match="空区间"):
+        c.compile(json.dumps({"type": "string", "minLength": 5, "maxLength": 2}))
+    with pytest.raises(RuntimeError, match="过大"):
+        c.compile(json.dumps({"type": "string", "maxLength": 99999999}))

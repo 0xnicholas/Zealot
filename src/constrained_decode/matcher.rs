@@ -196,6 +196,8 @@ fn count_states(gt: &GrammarType) -> usize {
 // - EOS 门控是 token-id 级：含结构字节的多字节 token（如 `Ġ}`）可绕过 EOS 屏蔽
 
 const MAX_AUTO_STATES: usize = 1 << 18; // 262144：压缩前防爆上限（超限 → SchemaTooComplex）
+/// M5-⑥：string 长度计数上限（content/esc/u×4 共 6 状态 × horizon ≤ 预算）。
+const MAX_LENGTH_COUNTER: usize = 32_768;
 const MAX_ARRAY_COUNTER: usize = 1024; // 数组 min/max 计数器状态上限
 const WS_BYTES: [u8; 4] = [0x20, 0x09, 0x0A, 0x0D]; // space / tab / LF / CR
 
@@ -410,26 +412,129 @@ impl AutoBuilder {
                     exits: vec![s],
                 }
             }
-            GrammarType::String { .. } => {
-                // s0 期待 `"` → s1 内容（除 `"`/`\\` 外停留）→ sx 收尾；`\\` → esc → 回内容
-                let s0 = self.new_state()?;
-                let s1 = self.new_state()?;
-                let esc = self.new_state()?;
-                let sx = self.new_state()?;
-                self.add_edge(s0, b'"', s1);
-                for b in 0..=255u8 {
-                    if b != b'"' && b != b'\\' {
-                        self.add_stay(s1, b);
+            GrammarType::String {
+                min_length,
+                max_length,
+                ..
+            } => {
+                // M5-⑥：minLength/maxLength 真正执行。
+                // 无约束（min=0 且无 max）→ 紧凑形态（旧行为，长度不计数）。
+                // 有约束 → 计数自动机：content_k / esc_k / u1..u4_k（k = 已消费码点数）。
+                // 码点计数：ASCII/首字节（<0x80 或 ≥0xC0）= 1，UTF-8 连续字节 = 0；
+                // `\x`（非 u）转义 = 1，`\uXXXX` = 1（代理对按 2 计，文档化偏差）；
+                // min 门控收尾 `"`（k ≥ min），max 封顶（k == max 仅可收尾）；
+                // 仅 min 时 k == min 冻结为吸收态（不再计数）。
+                let min = *min_length;
+                let max = *max_length;
+                if min == 0 && max.is_none() {
+                    let s0 = self.new_state()?;
+                    let s1 = self.new_state()?;
+                    let esc = self.new_state()?;
+                    let sx = self.new_state()?;
+                    self.add_edge(s0, b'"', s1);
+                    for b in 0..=255u8 {
+                        if b != b'"' && b != b'\\' {
+                            self.add_stay(s1, b);
+                        }
                     }
-                }
-                self.add_edge(s1, b'"', sx);
-                self.add_edge(s1, b'\\', esc);
-                // esc 是全新状态：整块构建 256 条边（逐条 insert 会 O(n²) 拖慢大 schema）
-                self.states[esc].edges = (0..=255u8).map(|b| (b, s1)).collect();
-                self.set_final(sx);
-                AutoOut {
-                    start: s0,
-                    exits: vec![sx],
+                    self.add_edge(s1, b'"', sx);
+                    self.add_edge(s1, b'\\', esc);
+                    // esc 是全新状态：整块构建 256 条边（逐条 insert 会 O(n²) 拖慢大 schema）
+                    self.states[esc].edges = (0..=255u8).map(|b| (b, s1)).collect();
+                    self.set_final(sx);
+                    AutoOut {
+                        start: s0,
+                        exits: vec![sx],
+                    }
+                } else {
+                    let max = max.unwrap_or(min as u64);
+                    if max < min as u64 {
+                        return Err(ZealotError::SchemaCompileError(format!(
+                            "string 空区间：minLength {min} > maxLength {max}"
+                        )));
+                    }
+                    let horizon = max as usize;
+                    if horizon > MAX_LENGTH_COUNTER {
+                        return Err(ZealotError::SchemaCompileError(format!(
+                            "minLength/maxLength {horizon} 过大（上限 {MAX_LENGTH_COUNTER}）"
+                        )));
+                    }
+                    let free = max_length.is_none(); // 仅 min：k == min 后冻结（吸收态）
+                                                     // 预建 content/esc/u 状态（k = 0..=horizon），再建入口 s0
+                    let mut content: Vec<usize> = Vec::with_capacity(horizon + 1);
+                    let mut esc: Vec<usize> = Vec::with_capacity(horizon + 1);
+                    let mut u1: Vec<usize> = Vec::with_capacity(horizon + 1);
+                    let mut u2: Vec<usize> = Vec::with_capacity(horizon + 1);
+                    let mut u3: Vec<usize> = Vec::with_capacity(horizon + 1);
+                    let mut u4: Vec<usize> = Vec::with_capacity(horizon + 1);
+                    for _ in 0..=horizon {
+                        content.push(self.new_state()?);
+                        esc.push(self.new_state()?);
+                        u1.push(self.new_state()?);
+                        u2.push(self.new_state()?);
+                        u3.push(self.new_state()?);
+                        u4.push(self.new_state()?);
+                    }
+                    let s0 = self.new_state()?;
+                    let sx = self.new_state()?;
+                    self.add_edge(s0, b'"', content[0]);
+                    self.set_final(sx);
+                    for k in 0..=horizon {
+                        let cur = content[k];
+                        let absorbing = free && k == horizon;
+                        // 内容边整块构建（按字节序自然有序；O(n²) 逐条 insert 拖慢大 horizon）
+                        let mut edges: Vec<(u8, usize)> = Vec::with_capacity(256);
+                        for b in 0..=255u8 {
+                            if b == b'"' {
+                                // min 门控收尾
+                                if k >= min {
+                                    edges.push((b, sx));
+                                }
+                            } else if b == b'\\' {
+                                // 转义：仅当可回落到活目标时接线（max 封顶处不可再转义）
+                                if absorbing || k < horizon {
+                                    edges.push((b, esc[k]));
+                                }
+                            } else if !(0x80..0xC0).contains(&b) {
+                                // 码点首字节：+1；吸收态停留
+                                if absorbing {
+                                    self.add_stay(cur, b);
+                                } else if k < horizon {
+                                    edges.push((b, content[k + 1]));
+                                }
+                            } else {
+                                // UTF-8 连续字节：不计数（停留）
+                                self.add_stay(cur, b);
+                            }
+                        }
+                        self.states[cur].edges = edges;
+                        // 转义结构：`\x`（非 u）→ +1；`\uXXXX` → +1（hex 链）
+                        let e = esc[k];
+                        let esc_next = if k < horizon {
+                            content[k + 1]
+                        } else if free {
+                            content[horizon]
+                        } else {
+                            continue; // max 封顶：esc[k] 不可达（未接线），跳过
+                        };
+                        let mut esc_edges: Vec<(u8, usize)> =
+                            (0..=255u8).map(|b| (b, esc_next)).collect();
+                        esc_edges[b'u' as usize].1 = u1[k];
+                        self.states[e].edges = esc_edges;
+                        // hex 边整块构建（48 个 hex 字节，按字节序）
+                        let hex_dst = [u2[k], u3[k], u4[k], esc_next];
+                        for (i, src) in [u1[k], u2[k], u3[k], u4[k]].iter().enumerate() {
+                            let edges: Vec<(u8, usize)> = (0..=255u8)
+                                .filter(|b| b.is_ascii_hexdigit())
+                                .map(|b| (b, hex_dst[i]))
+                                .collect();
+                            self.states[*src].edges = edges;
+                        }
+                    }
+                    AutoOut {
+                        start: s0,
+                        exits: vec![sx],
+                    }
                 }
             }
             GrammarType::Number => {
@@ -1659,6 +1764,181 @@ mod tests {
         let n = ConstrainedGrammar::new(GrammarType::Null);
         assert_eq!(walk(&n, b"null"), (true, true));
         assert_eq!(walk(&n, b"nil"), (false, false));
+    }
+
+    #[test]
+    fn test_automaton_string_lengths() {
+        // M5-⑥：minLength/maxLength 计数执行（码点计数）
+        let mk = |min: usize, max: Option<u64>| {
+            ConstrainedGrammar::new(GrammarType::String {
+                min_length: min,
+                max_length: max,
+                pattern: None,
+                enum_values: None,
+            })
+        };
+        // 仅 min
+        let g = mk(3, None);
+        for ok in [b"\"abc\"".as_slice(), b"\"abcdef\"", b"\"\xe4\xb8\xadab\""] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "min3 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [
+            b"\"ab\"".as_slice(),
+            b"\"\"",
+            b"\"\xe4\xb8\xada\"",
+            b"\"\\u0041\"",
+        ] {
+            assert!(
+                !walk(&g, bad).1,
+                "min3 {} 应不可收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 仅 max
+        let g = mk(0, Some(2));
+        for ok in [b"\"\"".as_slice(), b"\"ab\""] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "max2 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"\"abc\"".as_slice(), b"\"abcd\""] {
+            assert!(
+                !walk(&g, bad).0,
+                "max2 {} 应非法",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // min+max
+        let g = mk(2, Some(4));
+        for ok in [b"\"ab\"".as_slice(), b"\"abcd\""] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "2..4 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"\"a\"".as_slice(), b"\"abcde\""] {
+            assert!(
+                !walk(&g, bad).1,
+                "2..4 {} 应不可收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // max==0
+        let g = mk(0, Some(0));
+        assert_eq!(walk(&g, b"\"\""), (true, true));
+        assert!(!walk(&g, b"\"a\"").0);
+    }
+
+    #[test]
+    fn test_automaton_string_lengths_escapes_unicode() {
+        let mk = |min: usize, max: Option<u64>| {
+            ConstrainedGrammar::new(GrammarType::String {
+                min_length: min,
+                max_length: max,
+                pattern: None,
+                enum_values: None,
+            })
+        };
+        // 转义计数：`\\n` = 1、`\\uXXXX` = 1
+        let g = mk(2, None);
+        assert_eq!(walk(&g, b"\"a\\nb\""), (true, true), "a+\\n+b = 3");
+        assert_eq!(
+            walk(&g, b"\"\\u0041\""),
+            (false, false),
+            "\\u0041 单码点 < 2"
+        );
+        assert_eq!(
+            walk(&g, b"\"a\\u0041b\""),
+            (true, true),
+            "a+\\u0041+b = 3 ≥ 2"
+        );
+        // 严格 hex：`\\uZZZZ` 拒绝（计数形态）
+        assert!(!walk(&g, b"\"a\\uZZZZb\"").0);
+        // UTF-8 码点：`中`（3 字节）= 1 码点；孤立连续字节 = 0
+        assert_eq!(
+            walk(&g, b"\"\xe4\xb8\xad\xe4\xb8\xad\""),
+            (true, true),
+            "2 码点"
+        );
+        assert_eq!(
+            walk(&g, b"\"\xe4\xb8\xad\""),
+            (false, false),
+            "1 码点 < 2 不可收尾"
+        );
+        // max 封顶处不可再转义（续写被拒）
+        let g = mk(0, Some(3));
+        assert!(!walk(&g, b"\"abc\\n\"").0, "3+1 > 3");
+        assert_eq!(walk(&g, b"\"abc\""), (true, true));
+        // 前缀语义：min 未满足时中途 token 仍可续写
+        assert_eq!(walk(&g, b"\"ab"), (true, false));
+        let g = mk(3, None);
+        assert_eq!(walk(&g, b"\"ab"), (true, false), "前缀合法");
+        // 仅 min 冻结：k == min 后任意续写
+        let g = mk(1, None);
+        for ok in [b"\"a\"".as_slice(), b"\"abcdefgh\""] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "min1 {}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+    }
+
+    #[test]
+    fn test_string_length_invalid_ranges_error() {
+        // min > max → 空区间错误；过大 horizon → 错误
+        let bad1 = GrammarType::String {
+            min_length: 5,
+            max_length: Some(2),
+            pattern: None,
+            enum_values: None,
+        };
+        assert!(ByteAutomaton::compile(&bad1).is_err(), "min > max 应报错");
+        let bad2 = GrammarType::String {
+            min_length: 0,
+            max_length: Some(MAX_LENGTH_COUNTER as u64 + 1),
+            pattern: None,
+            enum_values: None,
+        };
+        assert!(ByteAutomaton::compile(&bad2).is_err(), "horizon 过大应报错");
+        let bad3 = GrammarType::String {
+            min_length: MAX_LENGTH_COUNTER + 1,
+            max_length: None,
+            pattern: None,
+            enum_values: None,
+        };
+        assert!(ByteAutomaton::compile(&bad3).is_err(), "min 过大应报错");
+        let g = ConstrainedGrammar::new(bad1);
+        assert!(g.automaton_rejected());
+    }
+
+    #[test]
+    fn test_string_lengths_compose_with_pattern() {
+        // M5-⑥：长度与 pattern 可组合（pattern 执行随 #22；此处长度照常生效）
+        let g = ConstrainedGrammar::new(GrammarType::String {
+            min_length: 2,
+            max_length: Some(3),
+            pattern: Some("^[a-z]+$".into()),
+            enum_values: None,
+        });
+        assert_eq!(walk(&g, b"\"ab\""), (true, true));
+        assert_eq!(
+            walk(&g, b"\"abcd\""),
+            (false, false),
+            "超 max 直接死（不可续不可收尾）"
+        );
+        assert_eq!(walk(&g, b"\"a\""), (false, false), "低于 min 不可收尾");
     }
 
     #[test]
