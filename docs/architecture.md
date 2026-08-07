@@ -412,7 +412,7 @@ Zealot 测试金字塔：
 | 层级 | 框架 | 覆盖 | 运行环境 |
 |------|------|------|---------|
 | Rust 单元测试 | `cargo test --lib` | Block Manager, Scheduler, Engine, Sampling, Tokenizer, Constrained Decode | CI（无 GPU） |
-| Property-based | `proptest` | 随机 Block Manager 操作序列、schema/JSON 往返 | CI |
+| Property-based | `proptest` | 随机 Block Manager 操作序列（issue #10 已落地：`tests/block_manager_proptest.rs`，模型对照 + 引用守恒）；schema/JSON 往返待 M5 | CI |
 | 并发正确性 | `loom` | Block Manager Free List 多线程竞争模拟。运行：`ZEALOT_LOOM=1 cargo test --lib loom -- --test-threads=1`（`build.rs` 仅对本 crate 发射 `cfg(loom)`，避免全局 `--cfg loom` 破坏 tokio 依赖） | CI |
 | Python 集成 | `pytest` | PyO3 接口一致性、错误转换、`StaleHandle` 检测 | CI（无 GPU） |
 | FFI 基准测试 | `criterion` | Block Manager 单次操作延迟、GIL 持有时间 | CI |

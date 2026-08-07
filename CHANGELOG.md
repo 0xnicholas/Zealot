@@ -7,6 +7,9 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M4 收官：proptest BlockManager 随机序列测试（issue #10）——模型对照法
+  （free list 栈 + refcount/generation），逐操作断言无重复分配 / stale 拒绝 /
+  refcount 归零才回池 / generation 递增 + 引用守恒；mutation 验证有效
 - M4 收官：pytest 集成测试面落地（issue #9）——test_block_manager.py
   （接口一致性/错误转换/StaleHandle/池语义）+ test_constrained_decode.py
   （编译/缓存/边界/嵌套深度/对抗性 10001 属性 schema 拒绝 §12-6/超时守卫），

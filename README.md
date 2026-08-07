@@ -154,7 +154,7 @@ cargo test --test cpu_infer_e2e -- --nocapture
 - **Rust 单元测试**：每个 crate 内的 `#[cfg(test)]` 模块，覆盖纯逻辑
 - **Python 集成测试**：`pytest tests/`（前置：`maturin develop` 安装扩展）——PyO3 接口一致性、错误转换、StaleHandle 检测、对抗性 schema 拒绝（§12-6）
 - **GPU 集成测试**（Phase 2 后期）：真实 GPU 环境，验证 Block Manager ↔ CUDA 交互
-- **Property-based testing**：Block Manager 分配/释放序列的随机测试（proptest）
+- **Property-based testing**：`cargo test --test block_manager_proptest`——随机分配/释放/引用操作序列对照模型（free list 栈 + refcount/generation），不变量：无重复分配、stale handle 拒绝、refcount 归零才回池、generation 递增
 
 ## 新模型支持
 

@@ -39,6 +39,8 @@ pyo3 = { version = "0.23", features = ["auto-initialize"] }
 loom = "0.7"
 # M4 §8.1: FFI 微基准（benches/）
 criterion = "0.5"
+# M4 §8: Block Manager 随机操作序列 property-based 测试
+proptest = "1"
 
 [[bench]]
 name = "block_manager"
