@@ -7,6 +7,14 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-⑧：string pattern 执行（issue #22）——新 regex.rs 引擎：解析（字面量/字符类/
+  `.`/转义 `\d\w\s` 等/量词 `*+?{n,m}`/分组/交替）→ Thompson NFA → 子集构造
+  DFA → 死状态剪枝；**锚定语义**（业界惯例：llama.cpp 要求 ^…$、outlines #1083）——
+  pattern 约束整个字符串，首尾 `^`/`$` 接受并剥离（其余位置报错）；不支持特性
+  （环视/反向引用/词边界/命名组/原子组/量词叠加）显式报错不静默；懒量词接受
+  （语言等价）；NFA/DFA 状态上限防爆；与 minLength/maxLength 乘积组合
+  （复用 format 模板机制 compile_anchored_template）；pattern+format 互斥报错；
+  语言含裸 `\`/`"`（JSON 字符串无法表示）→ 显式报错
 - M5-⑦：string format 子集（issue #21）——email（local 点不可首尾/连续 +
   域名 label）、date（YYYY-MM-DD，月 01-12 日 01-31 结构校验）、date-time
   （date T time，T/t 分隔，裸日期不可收尾）、time（HH:MM:SS(.f+)?(Z|[+-]HH:MM)?）、

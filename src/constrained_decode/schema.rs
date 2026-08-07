@@ -737,6 +737,32 @@ mod tests {
     }
 
     #[test]
+    fn test_string_pattern_compile_and_errors() {
+        // M5-⑧：pattern 编译执行（锚定语义）；不支持特性/冲突显式报错
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        for pat in [r"^\d+$", r"[a-z]+", "abc|def", r"\w{2,4}"] {
+            let schema = serde_json::json!({ "type": "string", "pattern": pat });
+            let g = compiler
+                .compile_value(&schema)
+                .unwrap_or_else(|e| panic!("pattern {pat} 应支持: {e}"));
+            assert!(!g.automaton_rejected(), "pattern {pat} 自动机应可编译");
+        }
+        for pat in [r"(?=a)", r"a\1", "("] {
+            let schema = serde_json::json!({ "type": "string", "pattern": pat });
+            let err = compiler.compile_value(&schema).unwrap_err();
+            assert!(err.to_string().contains("pattern"), "{pat}: {err}");
+        }
+        // pattern + format 冲突
+        let err = compiler
+            .compile(
+                r#"{"type": "string", "pattern": "^a$", "format": "date"}"#,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("pattern"), "{err}");
+    }
+
+    #[test]
     fn test_integer_oversize_multiple_of_error() {
         // 区间 + 大 multipleOf → 状态预算超限 → 编译错误
         let compiler = JsonSchemaCompiler::new(16, 10000, 500);

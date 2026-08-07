@@ -355,3 +355,45 @@ def test_string_format_unsupported_errors():
     for fmt in ["binary", "byte", "password", "int32"]:
         with pytest.raises(RuntimeError, match="暂不支持"):
             c.compile(json.dumps({"type": "string", "format": fmt}))
+
+
+def test_string_pattern_walk(tmp_path):
+    """M5-⑧：pattern 锚定语义——真实词表 walk 正反例。"""
+    vocab = {chr(i): i for i in range(256)}
+    tok_path = tmp_path / "tokenizer.json"
+    tok_path.write_text(json.dumps({"model": {"type": "BPE", "vocab": vocab}}))
+    c = make_compiler()
+
+    def walk_ok(gs, text):
+        st = 0
+        for b in text.encode("utf-8"):
+            if b not in gs.allowed_tokens(st):
+                return False
+            st = gs.advance(st, b)
+        return gs.is_valid_final(st)
+
+    cases = [
+        (r"^\d{3}-\d{2}$", ['"123-45"'], ['"12-345"', '"1234-56"']),
+        (r"[a-z]+", ['"abc"'], ['"a1"', '"ABC"']),
+        (r"(a|b)c", ['"ac"', '"bc"'], ['"cc"', '"a"']),
+        (r"a{2,3}", ['"aa"', '"aaa"'], ['"a"', '"aaaa"']),
+        ("abc", ['"abc"'], ['"xabc"', '"abcx"']),  # 锚定语义
+        ("", ['""'], ['"a"']),  # 空 pattern 只匹配空串
+    ]
+    for pat, ok_list, bad_list in cases:
+        g = c.compile(json.dumps({"type": "string", "pattern": pat}))
+        g.load_tokenizer(str(tok_path))
+        for t in ok_list:
+            assert walk_ok(g, t), f"{pat!r} 应接受 {t}"
+        for t in bad_list:
+            assert not walk_ok(g, t), f"{pat!r} 应拒绝 {t}"
+
+
+def test_string_pattern_unsupported_and_conflict():
+    """M5-⑧：不支持特性（环视/反向引用/未闭合）与 pattern+format 冲突 → 报错。"""
+    c = make_compiler()
+    for pat in ["(?=a)", "(?!a)", "a\\1", "(", "["]:
+        with pytest.raises(RuntimeError, match="pattern"):
+            c.compile(json.dumps({"type": "string", "pattern": pat}))
+    with pytest.raises(RuntimeError, match="pattern"):
+        c.compile(json.dumps({"type": "string", "pattern": "^a$", "format": "date"}))

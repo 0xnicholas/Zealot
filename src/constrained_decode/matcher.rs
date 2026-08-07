@@ -431,12 +431,22 @@ impl AutoBuilder {
             GrammarType::String {
                 min_length,
                 max_length,
+                pattern,
                 format,
                 ..
             } => {
+                if pattern.is_some() && format.is_some() {
+                    // M5-⑦/⑧：两者都指定 → 无法同时满足（不静默丢弃其一）
+                    return Err(ZealotError::SchemaCompileError(
+                        "string 不能同时指定 pattern 与 format".into(),
+                    ));
+                }
                 if let Some(f) = format {
-                    // M5-⑦：format 内容约束（与长度组合见 compile_format_string）
+                    // M5-⑦：format 内容约束（与长度组合见 compile_anchored_template）
                     self.compile_format_string(*min_length, *max_length, f)?
+                } else if let Some(pat) = pattern {
+                    // M5-⑧：pattern 锚定语义（与长度组合见 compile_anchored_template）
+                    self.compile_pattern_string(*min_length, *max_length, pat)?
                 } else {
                     // M5-⑥：minLength/maxLength 真正执行。
                     // 无约束（min=0 且无 max）→ 紧凑形态（旧行为，长度不计数）。
@@ -829,7 +839,98 @@ impl AutoBuilder {
     ) -> Result<AutoOut, ZealotError> {
         let fstart = self.states.len();
         let (fs, _ffinals) = self.build_format(f)?;
-        let f_count = self.states.len() - fstart;
+        let template: Vec<(Vec<(u8, usize)>, bool)> = self.states[fstart..]
+            .iter()
+            .map(|st| (st.edges.clone(), st.is_final))
+            .collect();
+        self.compile_anchored_template(min, max, template, fs - fstart)
+    }
+
+    /// M5-⑧：pattern（锚定语义）——regex DFA 物化 + 与长度计数乘积。
+    /// JSON 字符串无法包含裸 `"`/`\\`：这类内容边丢弃（文档化）；
+    /// 产物与 format 共用 compile_anchored_template。
+    fn compile_pattern_string(
+        &mut self,
+        min: usize,
+        max: Option<u64>,
+        pattern: &str,
+    ) -> Result<AutoOut, ZealotError> {
+        let dfa =
+            super::regex::compile_pattern(pattern).map_err(ZealotError::SchemaCompileError)?;
+        let mut template: Vec<(Vec<(u8, usize)>, bool)> = Vec::with_capacity(dfa.transitions.len());
+        for edges in &dfa.transitions {
+            let edges: Vec<(u8, usize)> = edges
+                .iter()
+                .copied()
+                .filter(|&(b, _)| b != b'"' && b != b'\\')
+                .collect();
+            let is_final = dfa.finals.contains(&(template.len()));
+            template.push((edges, is_final));
+        }
+        // 死状态剪枝（无出边且非终态的 regex 状态）
+        let n = template.len();
+        let mut alive = vec![false; n];
+        for (i, (_, is_final)) in template.iter().enumerate() {
+            if *is_final {
+                alive[i] = true;
+            }
+        }
+        loop {
+            let mut changed = false;
+            for i in 0..n {
+                if alive[i] {
+                    continue;
+                }
+                if template[i].0.iter().any(|&(_, t)| alive[t]) {
+                    alive[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut remap = vec![usize::MAX; n];
+        let mut next_id = 0;
+        for i in 0..n {
+            if alive[i] {
+                remap[i] = next_id;
+                next_id += 1;
+            }
+        }
+        let mut compact: Vec<(Vec<(u8, usize)>, bool)> = Vec::with_capacity(next_id);
+        for i in 0..n {
+            if !alive[i] {
+                continue;
+            }
+            let edges = template[i]
+                .0
+                .iter()
+                .filter(|&&(_, t)| alive[t])
+                .map(|&(b, t)| (b, remap[t]))
+                .collect();
+            compact.push((edges, template[i].1));
+        }
+        let start_fi = remap[dfa.start];
+        if start_fi == usize::MAX || compact.is_empty() {
+            // 语言为空：pattern 要求内容含裸 `\\`/`"`，JSON 字符串无法表示
+            return Err(ZealotError::SchemaCompileError(
+                "pattern 要求的内容包含裸 `\\` 或 `\"`（JSON 字符串内无法表示）".into(),
+            ));
+        }
+        self.compile_anchored_template(min, max, compact, start_fi)
+    }
+
+    /// 模板自动机（format/regex 共用）× 长度计数乘积：状态 (fi, k)，
+    /// k = 已消费码点数；min 门控收尾、max 封顶、仅 min 冻结。
+    fn compile_anchored_template(
+        &mut self,
+        min: usize,
+        max: Option<u64>,
+        template: Vec<(Vec<(u8, usize)>, bool)>,
+        start_fi: usize,
+    ) -> Result<AutoOut, ZealotError> {
+        let t_count = template.len();
         let min_only = max.is_none();
         let max = max.unwrap_or(min as u64);
         if max < min as u64 {
@@ -844,31 +945,25 @@ impl AutoBuilder {
             )));
         }
         let cols = horizon + 1;
-        if f_count * cols > MAX_AUTO_STATES {
+        if t_count * cols > MAX_AUTO_STATES {
             return Err(ZealotError::SchemaCompileError(format!(
-                "format+长度组合过大（{f_count} × {cols} 状态）"
+                "模板×长度组合过大（{t_count} × {cols} 状态）"
             )));
         }
         let absorbing = min_only; // 仅 min：k == horizon 后冻结
-                                  // 模板：format 自动机状态（边 + final）
-        let template: Vec<(Vec<(u8, usize)>, bool)> = self.states[fstart..]
-            .iter()
-            .map(|st| (st.edges.clone(), st.is_final))
-            .collect();
         let s0 = self.new_state()?;
         let sx = self.new_state()?;
-        let mut grid: Vec<usize> = Vec::with_capacity(f_count * cols);
-        for _ in 0..(f_count * cols) {
+        let mut grid: Vec<usize> = Vec::with_capacity(t_count * cols);
+        for _ in 0..(t_count * cols) {
             grid.push(self.new_state()?);
         }
         let idx = |fi: usize, k: usize| fi * cols + k;
-        self.add_edge(s0, b'"', grid[idx(fs - fstart, 0)]);
+        self.add_edge(s0, b'"', grid[idx(start_fi, 0)]);
         self.set_final(sx);
         for (fi, (edges, is_final)) in template.iter().enumerate() {
             for k in 0..=horizon {
                 let cur = grid[idx(fi, k)];
                 for &(b, t) in edges {
-                    let tf = t - fstart;
                     let k2 = if absorbing {
                         (k + cp_count(b)).min(horizon)
                     } else if k + cp_count(b) <= horizon {
@@ -876,7 +971,7 @@ impl AutoBuilder {
                     } else {
                         continue; // max 封顶：不可再续
                     };
-                    self.add_edge(cur, b, grid[idx(tf, k2)]);
+                    self.add_edge(cur, b, grid[idx(t, k2)]);
                 }
                 if *is_final && k >= min {
                     self.add_edge(cur, b'"', sx);
@@ -2769,6 +2864,144 @@ mod tests {
             enum_values: None,
             format: Some(f),
         })
+    }
+
+    #[test]
+    fn test_automaton_string_pattern() {
+        // M5-⑧：锚定语义 + 常用构造
+        let mk = |pat: &str, min: usize, max: Option<u64>| {
+            ConstrainedGrammar::new(GrammarType::String {
+                min_length: min,
+                max_length: max,
+                pattern: Some(pat.into()),
+                enum_values: None,
+                format: None,
+            })
+        };
+        let g = mk(r"\d{3}-\d{2}", 0, None);
+        assert_eq!(walk(&g, b"\"123-45\""), (true, true));
+        assert_eq!(walk(&g, b"\"12-345\""), (false, false));
+        assert_eq!(walk(&g, b"\"123-4"), (true, false), "中途 token 可续写");
+        let g = mk(r"[a-z]+", 0, None);
+        assert_eq!(walk(&g, b"\"abc\""), (true, true));
+        assert_eq!(walk(&g, b"\"a1\""), (false, false));
+        assert_eq!(walk(&g, b"\"ABC\""), (false, false));
+        let g = mk(r"(a|b)c", 0, None);
+        for ok in [b"\"ac\"".as_slice(), b"\"bc\""] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "{}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"\"cc\"".as_slice(), b"\"a\""] {
+            assert!(
+                !walk(&g, bad).1,
+                "{} 应不可收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let g = mk(r"a{2,3}", 0, None);
+        for ok in [b"\"aa\"".as_slice(), b"\"aaa\""] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "{}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"\"a\"".as_slice(), b"\"aaaa\""] {
+            assert!(
+                !walk(&g, bad).1,
+                "{} 应不可收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 锚定语义：整体匹配（业界惯例）
+        let g = mk("abc", 0, None);
+        assert_eq!(walk(&g, b"\"abc\""), (true, true));
+        for bad in [b"\"xabc\"".as_slice(), b"\"abcx\""] {
+            assert!(
+                !walk(&g, bad).1,
+                "{} 应不可收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 显式首尾锚点等价
+        let g = mk("^abc$", 0, None);
+        assert_eq!(walk(&g, b"\"abc\""), (true, true));
+        // 与长度组合
+        let g = mk(r"[0-9]+", 2, Some(4));
+        for ok in [b"\"12\"".as_slice(), b"\"1234\""] {
+            assert_eq!(
+                walk(&g, ok),
+                (true, true),
+                "{}",
+                String::from_utf8_lossy(ok)
+            );
+        }
+        for bad in [b"\"1\"".as_slice(), b"\"12345\""] {
+            assert!(
+                !walk(&g, bad).1,
+                "{} 应不可收尾",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // 字面引号不可表示（JSON 裸引号边丢弃）：a.b 匹配 aXb、拒 a"b
+        let g = mk("a.b", 0, None);
+        assert_eq!(walk(&g, b"\"aXb\""), (true, true));
+        assert!(!walk(&g, b"\"a\"b\"").0, "裸引号不可作为内容");
+        // 空 pattern：只匹配空串
+        let g = mk("", 0, None);
+        assert_eq!(walk(&g, b"\"\""), (true, true));
+        assert_eq!(walk(&g, b"\"a\""), (false, false));
+        // 转义元字符：`a\.b` = a + 字面点 + b
+        let g = mk(r"a\.b", 0, None);
+        assert_eq!(walk(&g, b"\"a.b\""), (true, true));
+        assert_eq!(walk(&g, b"\"axb\""), (false, false));
+    }
+
+    #[test]
+    fn test_string_pattern_errors() {
+        // 不支持特性 → 编译错误；pattern+format 冲突 → 错误
+        let bad = |pat: &str| GrammarType::String {
+            min_length: 0,
+            max_length: None,
+            pattern: Some(pat.into()),
+            enum_values: None,
+            format: None,
+        };
+        for pat in [r"(?=a)", r"(?!a)", r"(?<name>a)", r"a\1", r"a\b", "(", "["] {
+            let g = bad(pat);
+            assert!(
+                ByteAutomaton::compile(&g).is_err(),
+                "pattern {pat:?} 应报错"
+            );
+        }
+        // 语言为空（要求裸反斜杠字面量）→ 显式报错
+        let no_repr = GrammarType::String {
+            min_length: 0,
+            max_length: None,
+            pattern: Some(r"a\\b".into()), // 内容需含字面 `\\`
+            enum_values: None,
+            format: None,
+        };
+        assert!(
+            ByteAutomaton::compile(&no_repr).is_err(),
+            "不可表示的语言应报错"
+        );
+        let conflict = GrammarType::String {
+            min_length: 0,
+            max_length: None,
+            pattern: Some("a".into()),
+            enum_values: None,
+            format: Some(StringFormat::Date),
+        };
+        assert!(
+            ByteAutomaton::compile(&conflict).is_err(),
+            "pattern+format 应冲突"
+        );
     }
 
     #[test]

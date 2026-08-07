@@ -1,4 +1,5 @@
 pub mod matcher;
+pub mod regex;
 pub mod schema;
 
 use self::matcher::ConstrainedGrammar;
