@@ -65,7 +65,9 @@ bm.free_blocks                  # → int（空闲 block 数）
 # 对已释放 handle 操作 → RuntimeError("Stale handle: ...")（generation 门控）
 ```
 
-**状态**：Phase 2 M4（GPU-free 可开发，分页算法用常规堆内存测试）
+**状态**：M4 收官（issue #7-#13）——loom 并发模拟、proptest 随机序列模型对照、
+§8.1 微基准 6 项全部达标（allocate 36.8ns，见 architecture.md §8.1）均落地。
+KV 分页用常规堆内存测试，CUDA 侧对接待 GPU 到位。
 
 ### Constrained Decode Engine（P1，Phase 2 M4-M5）
 
@@ -79,7 +81,9 @@ grammar.allowed_tokens(state)  # → List[int]
 grammar.advance(state, token)  # → int (next state)
 ```
 
-**状态**：CPU 侧开发 GPU-free，CUDA 侧采样集成需等 GPU 到位
+**状态**：M4 收官（issue #9 / #12）——pytest 面覆盖编译/缓存命中/边界/对抗性
+schema 拒绝（§12-6）/超时守卫；schema 编译缓存为真 LRU（cache_size 上限 +
+最久未用淘汰，含命中/淘汰统计）。CUDA 侧采样集成需等 GPU 到位。
 
 ### Scheduler（已实现，dev-mode 验证）
 

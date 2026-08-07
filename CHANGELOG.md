@@ -7,6 +7,17 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M4 收官：schema 缓存真 LRU（issue #12，§12-5）——原 HashMap 随机驱逐
+  （`keys().next()`）修正为 `lru` 0.18 `LruCache`（O(1) 命中提升/淘汰，
+  cache_size 上限）；`cache_size=0` 明确为禁用缓存；新增命中/未命中/淘汰
+  统计 getter；Rust 单测 + pytest 双面覆盖淘汰顺序（A,B,A,C → 必逐 B）
+- M4 收官：CI 闸门（issue #13）——clippy `-D warnings` 转硬闸（移除
+  continue-on-error，21 条既有告警清零 + 全仓 rustfmt 归一）；criterion
+  bench job（§8.1 的 8 项每次 CI 跑，HTML 报告 artifact，阈值不达标不挂 CI）；
+  pytest job（Python 3.12 + maturin build + wheel 安装 + pytest tests/）
+- M4 关闭（issue #4 判定式全部达成）——§12 八项 + proptest 全勾选；
+  architecture.md 双入口正式形态（gRPC Runtime Interface + HTTP OpenAI
+  兼容面，不再写"在 Gateway 完成"）；README Block Manager / CD 状态同步
 - M4 收官：docs/phase2_lifecycle.md（issue #11，§12-8）——构建 → 启动 →
   模型加载 → gRPC/HTTP 请求 → 流式返回 → 关闭全链路文档 + 实测通过
   （本地 tiny LLaMA，16 token 生成，SSE 6 帧）；发现并跟进 #26

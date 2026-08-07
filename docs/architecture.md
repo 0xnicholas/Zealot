@@ -1,6 +1,6 @@
 # Zealot 推理引擎架构设计
 
-**日期**: 2026-07-13 · **上次修订**: 2026-07-13 (架构评审)
+**日期**: 2026-07-13 · **上次修订**: 2026-08-07 (M4 收官：双入口正式形态、§12 勾选)
 **依赖**: ADR-003（vLLM 基线）、ADR-009（语言栈）、ADR-010（Backend Runtime）
 
 ---
@@ -32,10 +32,12 @@ Zealot Backend ─────────────────────�
 ┌─────────────────────────────────────────────────┐
 │         Zealot 内部三层（单一 Rust 进程）          │
 │                                                  │
-│  Layer 1: Rust 入口层                             │
-│  ┌────────────────────────────────────────────┐  │
-│  │ tonic gRPC Server（Runtime Interface，ADR-010）│ │
-│  └───────────────────┬────────────────────────┘  │
+│  Layer 1: Rust 入口层（双入口）                    │
+│  ┌──────────────────────────┐ ┌────────────────┐  │
+│  │ tonic gRPC Server        │ │ HTTP OpenAI    │  │
+│  │（Runtime Interface，      │ │（/v1/chat/     │  │
+│  │  ADR-010）                │ │  completions）  │  │
+│  └─────────────┬────────────┘ └───────┬────────┘  │
 │  Layer 2: Rust Core（内核层）                    │
 │  ┌────────────────────────────────────────────┐  │
 │  │ ┌──────────┐ ┌──────────┐ ┌─────────────┐  │  │
@@ -65,7 +67,9 @@ Zealot Backend ─────────────────────�
 ```
 
 **分界原则**：
-- Layer 1（Rust）：tonic gRPC Server 接收 Runtime Interface 请求。OpenAI 兼容在 Gateway 完成，不在 Zealot 内。
+- Layer 1（Rust）：双入口——tonic gRPC Server 接收 Runtime Interface 请求；
+  HTTP OpenAI 兼容面（`/v1/chat/completions`，非流式 + SSE）为正式形态，
+  在 Zealot 内完成（`src/bin/zealot-backend.rs` + `src/openai.rs`），不再经 Gateway 转发。
 - Layer 2（Rust）：decode loop 全程 Rust native，通过 FFI 调用 CUDA kernel，不触及 Python。
 - Layer 3（CUDA）：vLLM 原版 kernel 的改装优化，不改架构只调参。
 - 嵌入式 Python：PyO3 在启动时调用 HuggingFace Model Loader 加载权重到 GPU，完成后释放 GIL 休眠（详见 §5）。
@@ -342,7 +346,7 @@ impl ConstrainedGrammar {
 
 | 维度 | 策略 |
 |------|------|
-| **Key** | `SHA256(schema_str)` 的前 8 字节 → `u64` |
+| **Key** | `DefaultHasher`（SipHash 变体）对 `schema_str` 的哈希 → `u64`（进程内语义；文档原称 SHA256 前 8 字节，代码为 DefaultHasher，已对齐） |
 | **上限** | 可配置，默认 128 条。LRU 淘汰 |
 | **失效** | 进程重启清空。无 TTL——schema 不变则 grammer 不变 |
 | **绕过缓存** | `compile(schema_str, bypass_cache=True)` |
@@ -372,7 +376,7 @@ Phase 2（M4-M6）：独立引擎
   - Scheduler (Rust, 逻辑等价于 vLLM continuous batching)
   - Attention / Quant kernel (CUDA)
   - Model Loader (Python, PyO3 嵌入)
-  - Gateway 通过 Runtime Interface gRPC 路由到 Zealot
+  - Gateway（平台层）通过 Runtime Interface gRPC / HTTP OpenAI 双入口路由到 Zealot
 
 Phase 3（M7-M12）：持续优化
   - Prefill-Decode 分离上线（Scheduler 增强）
@@ -500,13 +504,14 @@ target/wheels/
 
 ## 12. 约束清单
 
-以下约束在 M4-M5 交付前必须满足：
+以下约束在 M4-M5 交付前必须满足（M4 收官，issue #4 / #7-#14）：
 
-- [ ] Block Manager 使用 `BlockHandle`（generation counter），非裸 `usize`
-- [x] Block Manager free list 使用 `Mutex<Vec>` 启动，含测试用例（`loom` 并发模拟）
-- [x] `allocate()` 延迟 < 500ns（benchmark 验证，实测 36.8ns，见 §8.1）
-- [ ] `JsonSchemaCompiler::compile()` 有 `max_states` / `max_compile_ms` 防护
-- [ ] `JsonSchemaCompiler` 有 schema hash 缓存 + LRU 淘汰
-- [x] 对抗性 schema 拒绝测试（pytest + 10000 状态 schema）
-- [ ] §8.1 的 8 个 FFI benchmark 全部在 CI 中运行
+- [x] Block Manager 使用 `BlockHandle`（generation counter），非裸 `usize`
+- [x] Block Manager free list 使用 `Mutex<Vec>` 启动，含测试用例（`loom` 并发模拟，issue #7）
+- [x] `allocate()` 延迟 < 500ns（benchmark 验证，实测 36.8ns，见 §8.1，issue #8）
+- [x] `JsonSchemaCompiler::compile()` 有 `max_states` / `max_compile_ms` 防护（pytest 覆盖超限/超时/嵌套深度，issue #9）
+- [x] `JsonSchemaCompiler` 有 schema hash 缓存 + LRU 淘汰（真 LRU + 命中/淘汰测试，issue #12）
+- [x] 对抗性 schema 拒绝测试（pytest + 10000 状态 schema，issue #9）
+- [x] §8.1 的 8 个 FFI benchmark 全部在 CI 中运行（criterion bench job + HTML 报告 artifact，issue #13）
 - [x] `phase2_lifecycle.md` 单独文档，描述 Phase 2 可运行的完整路径（issue #11，全链路实测通过）
+- [x] Block Manager 随机序列 proptest（模型对照法，issue #10）
