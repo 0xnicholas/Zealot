@@ -67,7 +67,10 @@ fn count_states(gt: &GrammarType) -> usize {
         | GrammarType::Integer
         | GrammarType::Boolean
         | GrammarType::Null => 1,
-        GrammarType::Object { properties, .. } => 1 + properties.len(),
+        // 递归计入嵌套属性（issue #15）：嵌套结构使 max_states 防护覆盖深层 schema
+        GrammarType::Object { properties, .. } => {
+            1 + properties.values().map(count_states).sum::<usize>()
+        }
         GrammarType::Array { item_type, .. } => {
             1 + item_type.as_ref().map(|t| count_states(t)).unwrap_or(0)
         }
@@ -211,7 +214,7 @@ impl ConstrainedGrammar {
         }
     }
 
-    fn compute_is_valid_final(&self, _state: usize) -> bool {
+    fn compute_is_valid_final(&self, state: usize) -> bool {
         match &self.grammar_type {
             GrammarType::Any => true,
             GrammarType::String { min_length, .. } => {
@@ -224,14 +227,11 @@ impl ConstrainedGrammar {
             GrammarType::Boolean | GrammarType::Null => {
                 true // state 0 = valid final (word complete)
             }
-            GrammarType::Object {
-                required,
-                properties,
-                ..
-            } => {
-                // Valid if all required properties are accounted for
-                // State 0 represents the object root — valid if no required props remain
-                required.is_empty() || properties.is_empty()
+            GrammarType::Object { required, .. } => {
+                // 真状态机语义（issue #15）：state = 已遍历的属性槽位数。
+                // required 键全部遍历完（state >= required.len()）才可合法收尾；
+                // 可选字段（不在 required）允许缺省。
+                state >= required.len()
             }
             GrammarType::Array { .. } => {
                 true // empty array is valid at state 0
@@ -307,5 +307,103 @@ mod tests {
         let g = ConstrainedGrammar::new(GrammarType::Boolean);
         let err = g.allowed_tokens(999).unwrap_err();
         assert!(err.to_string().contains("out of range"));
+    }
+
+    fn object_grammar(props: Vec<(&str, GrammarType)>, required: Vec<&str>) -> ConstrainedGrammar {
+        let mut map = HashMap::new();
+        for (k, v) in props {
+            map.insert(k.to_string(), v);
+        }
+        ConstrainedGrammar::new(GrammarType::Object {
+            properties: map,
+            required: required.into_iter().map(String::from).collect(),
+            additional_properties: false,
+        })
+    }
+
+    fn string_leaf() -> GrammarType {
+        GrammarType::String {
+            min_length: 1,
+            max_length: None,
+            pattern: None,
+            enum_values: None,
+        }
+    }
+
+    #[test]
+    fn test_object_required_keys_must_be_traversed_before_final() {
+        // issue #15：required 键全部遍历完（state >= required.len()）才可合法收尾。
+        let g = object_grammar(
+            vec![("name", string_leaf()), ("age", GrammarType::Integer)],
+            vec!["name"],
+        );
+        assert!(
+            !g.is_valid_final(0).unwrap(),
+            "根状态不能收尾（required 未遍历）"
+        );
+        assert!(
+            g.is_valid_final(1).unwrap(),
+            "已遍历 1 个槽位 ≥ required 数"
+        );
+        assert!(g.is_valid_final(2).unwrap());
+    }
+
+    #[test]
+    fn test_object_two_required_need_two_slots() {
+        let g = object_grammar(
+            vec![
+                ("a", string_leaf()),
+                ("b", string_leaf()),
+                ("c", GrammarType::Boolean),
+            ],
+            vec!["a", "b"],
+        );
+        assert!(!g.is_valid_final(0).unwrap());
+        assert!(!g.is_valid_final(1).unwrap(), "只遍历 1 个槽位，b 未满足");
+        assert!(g.is_valid_final(2).unwrap());
+        assert!(g.is_valid_final(3).unwrap());
+    }
+
+    #[test]
+    fn test_object_optional_fields_may_be_omitted() {
+        // 无 required：根状态即可合法收尾（空对象 {} 也是合法输出）。
+        let g = object_grammar(
+            vec![("name", string_leaf()), ("age", GrammarType::Integer)],
+            vec![],
+        );
+        assert!(g.is_valid_final(0).unwrap());
+        assert!(g.is_valid_final(1).unwrap());
+    }
+
+    #[test]
+    fn test_object_required_missing_from_properties_never_final() {
+        // required 引用不存在的键：任何状态都无法收尾（正确语义——该对象不可构造）。
+        let g = object_grammar(vec![], vec!["missing"]);
+        assert!(!g.is_valid_final(0).unwrap());
+    }
+
+    #[test]
+    fn test_count_states_recursive_nested_object() {
+        // issue #15：state_count 递归计入嵌套属性。
+        let inner = object_grammar(vec![("x", GrammarType::Boolean)], vec![]); // 1 + 1 = 2
+        let outer = object_grammar(vec![("inner", inner.grammar_type.clone())], vec![]); // 1 + 2 = 3
+        assert_eq!(outer.state_count(), 3);
+    }
+
+    #[test]
+    fn test_count_states_recursive_array_and_union() {
+        let arr = ConstrainedGrammar::new(GrammarType::Array {
+            min_items: 0,
+            max_items: None,
+            item_type: Some(Box::new(
+                object_grammar(vec![("x", GrammarType::Boolean)], vec![]).grammar_type,
+            )), // 1 + 2 = 3
+        });
+        assert_eq!(arr.state_count(), 3);
+
+        let uni = ConstrainedGrammar::new(GrammarType::Union {
+            branches: vec![string_leaf(), object_grammar(vec![], vec![]).grammar_type], // 1 + 1 = 2
+        });
+        assert_eq!(uni.state_count(), 2);
     }
 }

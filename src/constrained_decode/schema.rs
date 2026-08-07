@@ -148,7 +148,17 @@ fn compile_schema(
         GrammarType::Any
     };
 
-    Ok(ConstrainedGrammar::new(grammar_type))
+    let grammar = ConstrainedGrammar::new(grammar_type);
+    // 层级检查（count_states 递归，覆盖嵌套/union 聚合；issue #15）：
+    // 任一子树超限即整体拒绝，max_states 防护不再只挡顶层 object。
+    if grammar.state_count() > max_states {
+        return Err(ZealotError::SchemaTooComplex {
+            states: grammar.state_count(),
+            limit: max_states,
+        }
+        .into());
+    }
+    Ok(grammar)
 }
 
 fn compile_string(schema: &JsonValue, _max_states: usize, _depth: usize) -> PyResult<GrammarType> {
@@ -193,15 +203,17 @@ fn compile_object(schema: &JsonValue, max_states: usize, depth: usize) -> PyResu
     let properties = schema
         .get("properties")
         .and_then(|v| v.as_object())
-        .map(|props| {
+        .map(|props| -> PyResult<HashMap<String, GrammarType>> {
             let mut prop_grammars = HashMap::new();
             for (name, prop_schema) in props {
-                if let Ok(grammar) = compile_schema(prop_schema, max_states, depth + 1) {
-                    prop_grammars.insert(name.clone(), grammar.grammar_type);
-                }
+                // no-silent-failures（issue #15）：子 schema 编译失败 → 整体报错，
+                // 不再 filter_map(.ok()) 静默丢弃。
+                let grammar = compile_schema(prop_schema, max_states, depth + 1)?;
+                prop_grammars.insert(name.clone(), grammar.grammar_type);
             }
-            prop_grammars
+            Ok(prop_grammars)
         })
+        .transpose()?
         .unwrap_or_default();
 
     let required: Vec<String> = schema
@@ -218,15 +230,6 @@ fn compile_object(schema: &JsonValue, max_states: usize, depth: usize) -> PyResu
         .get("additionalProperties")
         .map(|v| v.as_bool().unwrap_or(true))
         .unwrap_or(true);
-
-    let state_count: usize = properties.len() + 1;
-    if state_count > max_states {
-        return Err(ZealotError::SchemaTooComplex {
-            states: state_count,
-            limit: max_states,
-        }
-        .into());
-    }
 
     Ok(GrammarType::Object {
         properties,
@@ -258,11 +261,14 @@ fn compile_union(schema: &JsonValue, max_states: usize, depth: usize) -> PyResul
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|s| compile_schema(s, max_states, depth + 1).ok())
-                .map(|g| g.grammar_type)
-                .collect()
+                .map(|s| compile_schema(s, max_states, depth + 1))
+                .collect::<PyResult<Vec<_>>>()
         })
-        .unwrap_or_default();
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g| g.grammar_type)
+        .collect();
 
     Ok(GrammarType::Union { branches })
 }
@@ -383,5 +389,45 @@ mod tests {
         compiler.compile(a, None).unwrap(); // A 已被淘汰 → miss
         assert_eq!(compiler.cache_hits(), 1);
         assert_eq!(compiler.cache_misses(), 3);
+    }
+
+    #[test]
+    fn test_nested_object_max_states_boundary() {
+        // issue #15：count_states 递归后，max_states 覆盖嵌套结构。
+        // 每个子对象 1 + 2 叶子 = 3 states；外层 1 + N*3。
+        let sub = r#"{"type": "object", "properties": {"x": {"type": "boolean"}, "y": {"type": "integer"}}}"#;
+        let compiler = JsonSchemaCompiler::new(16, 10, 500);
+        // N=3 → 1 + 9 = 10 = max_states：边界接受
+        let schema_ok = format!(
+            r#"{{"type": "object", "properties": {{"a": {sub}, "b": {sub}, "c": {sub}}}}}"#
+        );
+        let g = compiler.compile(&schema_ok, None).unwrap();
+        assert_eq!(g.state_count(), 10);
+        // N=4 → 1 + 12 = 13 > 10：嵌套子 schema 触发 SchemaTooComplex
+        let schema_bad = format!(
+            r#"{{"type": "object", "properties": {{"a": {sub}, "b": {sub}, "c": {sub}, "d": {sub}}}}}"#
+        );
+        let err = compiler.compile(&schema_bad, None).unwrap_err();
+        assert!(err.to_string().contains("Schema too complex"));
+    }
+
+    #[test]
+    fn test_failed_child_schema_propagates_error() {
+        // issue #15：子 schema 编译失败 → 整体报错（原实现 filter_map(.ok())
+        // 静默丢弃失败属性，返回空对象）。
+        let compiler = JsonSchemaCompiler::new(16, 5, 500);
+        let schema = r#"{"type": "object", "properties": {"big": {"type": "object", "properties": {"a": {"type": "boolean"}, "b": {"type": "boolean"}, "c": {"type": "boolean"}, "d": {"type": "boolean"}, "e": {"type": "boolean"}}}}}"#;
+        // 子对象 1 + 5 = 6 > max_states=5 → 子编译失败必须向整体传播
+        let err = compiler.compile(schema, None).unwrap_err();
+        assert!(err.to_string().contains("Schema too complex"));
+    }
+
+    #[test]
+    fn test_union_branch_failure_propagates_error() {
+        // issue #15：union 分支超限 → 整体报错（原实现静默丢弃失败分支）。
+        let compiler = JsonSchemaCompiler::new(16, 5, 500);
+        let schema = r#"{"anyOf": [{"type": "boolean"}, {"type": "object", "properties": {"a": {"type": "boolean"}, "b": {"type": "boolean"}, "c": {"type": "boolean"}, "d": {"type": "boolean"}, "e": {"type": "boolean"}}}]}"#;
+        let err = compiler.compile(schema, None).unwrap_err();
+        assert!(err.to_string().contains("Schema too complex"));
     }
 }

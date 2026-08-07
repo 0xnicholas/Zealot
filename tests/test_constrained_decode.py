@@ -1,7 +1,8 @@
-"""M4 §9: JsonSchemaCompiler / ConstrainedGrammar PyO3 接口 + 对抗性 schema 拒绝。
+"""M4 §9 / M5-①: JsonSchemaCompiler / ConstrainedGrammar PyO3 接口 + 对抗性 schema 拒绝。
 
 §12-6 覆盖：构造 >10000 states 的 schema → SchemaTooComplex（RuntimeError）。
 §12-5 覆盖：缓存命中/淘汰统计 + 真 LRU 淘汰顺序（见 test_cache_lru_eviction）。
+M5-① 覆盖：required 收尾语义、嵌套 max_states、子 schema 失败整体报错。
 运行：`pytest tests/`（前置：`.venv/bin/maturin develop` 安装扩展）。
 """
 
@@ -92,6 +93,38 @@ def test_compile_union_schema():
     g = c.compile(json.dumps({"anyOf": [{"type": "string"}, {"type": "integer"}]}))
     assert g.state_count == 2
 
+
+def test_required_object_final_state_semantics():
+    """M5-①：required 键遍历完才可合法收尾；根状态不可直接收尾；可选字段允许缺省。"""
+    c = make_compiler()
+    g = c.compile(json.dumps(SIMPLE))  # required=["name"]
+    assert not g.is_valid_final(0)  # 根状态：required 未遍历
+    assert g.is_valid_final(1)  # 已遍历 1 个槽位 ≥ required 数
+    assert g.is_valid_final(g.state_count - 1)
+
+    g_opt = c.compile(json.dumps({"type": "object", "properties": {"x": {"type": "string"}}}))
+    assert g_opt.is_valid_final(0)  # 无 required：空对象 {} 合法
+
+
+def test_nested_schema_max_states_rejected():
+    """M5-①：count_states 递归后 max_states 覆盖嵌套结构（不再只挡顶层）。"""
+    c = make_compiler(max_states=10)
+    sub = {"type": "object", "properties": {"x": {"type": "boolean"}, "y": {"type": "integer"}}}
+    ok = {"type": "object", "properties": {"a": sub, "b": sub, "c": sub}}
+    g = c.compile(json.dumps(ok))  # 1 + 3*3 = 10 = max_states：边界接受
+    assert g.state_count == 10
+    bad = {"type": "object", "properties": {"a": sub, "b": sub, "c": sub, "d": sub}}
+    with pytest.raises(RuntimeError, match="Schema too complex"):
+        c.compile(json.dumps(bad))  # 1 + 4*3 = 13 > 10
+
+
+def test_failed_child_schema_not_silently_dropped():
+    """M5-①：子 schema 编译失败 → 整体报错（原实现静默丢弃失败属性）。"""
+    c = make_compiler(max_states=5)
+    big = {"type": "object", "properties": {f"p{i}": {"type": "boolean"} for i in range(5)}}
+    schema = {"type": "object", "properties": {"big": big}}
+    with pytest.raises(RuntimeError, match="Schema too complex"):
+        c.compile(json.dumps(schema))
 
 def test_invalid_json_rejected():
     c = make_compiler()
