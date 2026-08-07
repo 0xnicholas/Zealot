@@ -32,6 +32,7 @@ pub struct CpuModelRunner {
     lm_head: Vec<f32>,
     hidden_dim: usize,
     num_heads: usize,
+    num_kv_heads: usize,
     head_dim: usize,
     num_layers: usize,
     vocab_size: usize,
@@ -52,6 +53,7 @@ impl CpuModelRunner {
             lm_head: Vec::new(),
             hidden_dim: 0,
             num_heads: 0,
+            num_kv_heads: 1,
             head_dim: 0,
             num_layers: 0,
             vocab_size: 0,
@@ -99,6 +101,7 @@ impl CpuModelRunner {
             lm_head: weights.lm_head,
             hidden_dim: weights.hidden_dim,
             num_heads: weights.num_heads,
+            num_kv_heads: weights.num_kv_heads.max(1),
             head_dim: weights.head_dim,
             num_layers: weights.num_layers,
             vocab_size: weights.vocab_size,
@@ -183,6 +186,10 @@ impl ModelRunner for CpuModelRunner {
             }
 
             let proj_dim = self.num_heads * self.head_dim;
+            // M5-⑫（issue #26）：GQA —— k/v 按 kv 头宽投影（num_kv_heads < num_heads
+            // 时全宽投影会越界 panic），再 repeat-interleave 展开到 q 头数。
+            let kv_heads = self.num_kv_heads.max(1);
+            let kv_proj_dim = kv_heads * self.head_dim;
             let q_projected = crate::attention::matmul(
                 &embed_out,
                 &self.q_proj,
@@ -195,14 +202,14 @@ impl ModelRunner for CpuModelRunner {
                 &self.k_proj,
                 seq_len,
                 self.hidden_dim,
-                proj_dim,
+                kv_proj_dim,
             );
             let v_projected = crate::attention::matmul(
                 &embed_out,
                 &self.v_proj,
                 seq_len,
                 self.hidden_dim,
-                proj_dim,
+                kv_proj_dim,
             );
 
             let h = self.num_heads;
@@ -220,8 +227,8 @@ impl ModelRunner for CpuModelRunner {
                 out
             };
             let q = reshape(&q_projected);
-            let k = reshape(&k_projected);
-            let v = reshape(&v_projected);
+            let k = repeat_interleave_kv(&k_projected, kv_heads, h, seq_len, d);
+            let v = repeat_interleave_kv(&v_projected, kv_heads, h, seq_len, d);
 
             let attn_batch = AttentionBatch {
                 num_seqs: 1,
@@ -273,6 +280,29 @@ impl ModelRunner for CpuModelRunner {
     }
 }
 
+/// GQA kv 头展开（repeat-interleave）：
+/// 把 [seq_len × kv_heads×d] 的扁平投影展为 [num_heads × seq_len × d]，
+/// 第 head 个 q 头共享第 head % kv_heads 个 kv 头（MHA 时恒等）。
+fn repeat_interleave_kv(
+    src: &[f32],
+    kv_heads: usize,
+    num_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0_f32; num_heads * seq_len * head_dim];
+    for head in 0..num_heads {
+        let kh = head % kv_heads;
+        for pos in 0..seq_len {
+            for dim in 0..head_dim {
+                out[head * seq_len * head_dim + pos * head_dim + dim] =
+                    src[pos * kv_heads * head_dim + kh * head_dim + dim];
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +312,90 @@ mod tests {
         let runner = CpuModelRunner::new_cpu();
         assert_eq!(runner.states.len(), 0);
         assert_eq!(runner.hidden_dim, 0);
+    }
+}
+
+#[cfg(test)]
+mod gqa_tests {
+    use super::*;
+
+    #[test]
+    fn repeat_interleave_expands_kv_heads() {
+        // 2 kv 头 → 4 q 头：head % kv_heads 映射
+        let kv_heads = 2;
+        let num_heads = 4;
+        let seq_len = 3;
+        let d = 2;
+        // src[pos, kh, dim] = pos*100 + kh*10 + dim
+        let src: Vec<f32> = (0..seq_len * kv_heads * d).map(|i| i as f32).collect();
+        let out = repeat_interleave_kv(&src, kv_heads, num_heads, seq_len, d);
+        assert_eq!(out.len(), num_heads * seq_len * d);
+        for head in 0..num_heads {
+            let kh = head % kv_heads;
+            for pos in 0..seq_len {
+                for dim in 0..d {
+                    assert_eq!(
+                        out[head * seq_len * d + pos * d + dim],
+                        src[pos * kv_heads * d + kh * d + dim]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeat_interleave_mha_matches_old_reshape() {
+        // MHA（kv == heads）：输出与旧全宽 reshape 的 [heads×seq×d] 布局一致
+        let seq_len = 2;
+        let heads = 2;
+        let d = 3;
+        let src: Vec<f32> = (0..seq_len * heads * d).map(|i| i as f32).collect();
+        let out = repeat_interleave_kv(&src, heads, heads, seq_len, d);
+        let mut expect = vec![0.0_f32; heads * seq_len * d];
+        for head in 0..heads {
+            for pos in 0..seq_len {
+                for dim in 0..d {
+                    expect[head * seq_len * d + pos * d + dim] =
+                        src[pos * heads * d + head * d + dim];
+                }
+            }
+        }
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn gqa_step_no_panic() {
+        // 合成 GQA 权重（kv=2 < heads=4）跑一步：k/v 越界回归（issue #26）。
+        let mut runner = CpuModelRunner::new_cpu();
+        runner.hidden_dim = 8;
+        runner.num_heads = 4;
+        runner.num_kv_heads = 2;
+        runner.head_dim = 2;
+        runner.num_layers = 1;
+        runner.vocab_size = 4;
+        let rand = |len: usize| (0..len).map(|i| (i % 7) as f32 / 7.0).collect::<Vec<_>>();
+        runner.embedding = rand(4 * 8); // [vocab, hidden]
+        runner.q_proj = rand(8 * 8); // [hidden, heads*d]
+        runner.k_proj = rand(8 * 4); // [hidden, kv_heads*d] ← GQA 窄投影
+        runner.v_proj = rand(8 * 4);
+        runner.attn_proj = rand(8 * 8);
+        runner.lm_head = rand(8 * 4); // [hidden, vocab]
+
+        let mut sched =
+            crate::scheduler::Scheduler::new(crate::scheduler::SchedulerConfig::default()).unwrap();
+        let mut seq = sched
+            .make_sequence(
+                "gqa".into(),
+                vec![1, 2, 3],
+                16,
+                crate::scheduler::Priority::Medium,
+                Some(0),
+                crate::sampling::SamplingParams::default(),
+            )
+            .unwrap();
+        let mut batch = [&mut seq];
+        let outs = runner.step(&mut batch).expect("GQA step 不应越界 panic");
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].logits.as_ref().expect("logits").len(), 4);
     }
 }

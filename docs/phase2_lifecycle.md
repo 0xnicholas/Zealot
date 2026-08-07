@@ -169,8 +169,8 @@ grpcurl -plaintext -proto proto/runtime/v1/runtime.proto \
 
 | 限制 | 说明 | 影响 |
 |------|------|------|
-| 模型架构 | 仅 LLaMA 系命名（`self_attn.q_proj/k_proj/v_proj/o_proj`、`mlp.gate/up/down_proj`、rms_norm） | GPT-2（`c_attn` Conv1D + LayerNorm）等架构加载失败（`q_proj: AttributeError`），待后续里程碑支持 |
-| GQA | loader 已提取 `num_kv_heads`，但 CPU runner 前向按全宽 KV 投影计算 | 必须用 MHA 模型（`num_key_value_heads == num_attention_heads`），GQA 模型会越界 panic |
+| 模型架构 | 支持 LLaMA 系（`llama`/`mistral`：`q_proj` 命名）+ GPT-2（`c_attn` 切分 q/k/v、`c_proj`、`c_fc`/`c_proj`→FFN，M5-⑫ issue #26）；其他架构显式报错（`不支持的模型架构`） | 已知偏差：GPT-2 的 FFN 语义映射（gate:=c_fc、up:=c_fc）留给未来 runner 前向处理；bias 不加载 |
+| GQA | CPU runner 已实现 kv-head 展开（repeat-interleave，M5-⑫ issue #26） | `num_key_value_heads < num_attention_heads` 正常推理（不再越界）；MHA 恒等 |
 | 单模型 | 一次只加载一个模型（slot 机制） | 换模型需先 Unload |
 | 批处理 | `SubmitBatch` 仍 UNIMPLEMENTED | Scheduler 批语义后续接入 |
 | Python 在 decode loop | dev-mode 的 PyModelRunner 每次前向持有 GIL | 临时形态，GPU kernel 落地后移除 |
@@ -206,7 +206,7 @@ grpcurl -plaintext -proto proto/runtime/v1/runtime.proto \
 | 症状 | 原因 | 处理 |
 |------|------|------|
 | `import torch (venv? set ZEALOT_SITE_PACKAGES)` | 嵌入 CPython 找不到 torch | 设 `ZEALOT_SITE_PACKAGES` 指向 venv site-packages |
-| `q_proj: AttributeError ...` | 非 LLaMA 架构模型 | 换 LLaMA 系模型（§6） |
-| 越界 panic（`len is 2048 but the index is 2048`） | GQA 模型 | 换 MHA 配置（§6） |
+| `不支持的模型架构 ...` | 非支持列表架构（llama/mistral/gpt2） | 换支持架构模型（§6） |
+| 越界 panic（`len is 2048 but the index is 2048`） | GQA 模型（旧版本） | 升级到 M5-⑫ 后（CPU runner kv 头展开）不再越界 |
 | `couldn't connect to huggingface.co` | 网络不可达 | 设 `HF_ENDPOINT` 镜像，或用本地模型目录 |
 | 端口占用 | 另一服务已监听 | 换 `ZEALOT_GRPC_PORT` / `ZEALOT_HTTP_PORT` |

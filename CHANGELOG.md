@@ -7,6 +7,14 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-⑫：model_loader 架构探测 + CPU runner GQA（issue #26）——
+  ① 架构探测（config.model_type）：LLaMA 系（llama/mistral）+ GPT-2 命名适配
+  （attn.c_attn 行切分 q/k/v、c_proj→o、mlp.c_fc/c_proj→gate/up/down），其他架构
+  显式报错「不支持的模型架构」（不再 AttributeError 汤）；② CPU runner GQA：
+  k/v 按 kv 头宽投影 + repeat-interleave 展开（head % kv_heads），GQA 模型不再
+  越界 panic（MHA 恒等）；③ tiny-random-gpt2 CPU e2e 真实跑通（README §12 承诺
+  恢复，本地实测）；合成 GQA（kv=2）全链路 e2e 实测通过；单测 +3
+
 - M5-⑪ Bench 对比基准（issue #25）——scripts/bench_openai.py（对齐 vLLM
   benchmark_serving：并发 1/16/64 × 输入 ~100/1k/4k+ × 固定输出 256，聚合吞吐 +
   TTFT/TPOT P50/P95/P99，预热 + 稳定窗口 ≥60s + 多轮取中位，JSON 报告 + 摘要对比表

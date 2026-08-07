@@ -145,8 +145,9 @@ python3.12 -m venv .venv
 # transformers ≥4.47 要求 torch≥2.4；torch 2.2 不兼容 numpy 2.x
 
 # CPU 端到端真实推理测试（未设置 ZEALOT_E2E_MODEL 则自动跳过）
-# 注：model loader 仅支持 LLaMA 系架构（MHA 配置），详见 docs/phase2_lifecycle.md §6
-ZEALOT_E2E_MODEL=hf-internal-testing/tiny-random-LlamaForCausalLM \
+# 注：model loader 支持 LLaMA 系（llama/mistral）+ GPT-2（c_attn 切分）架构，
+#     CPU runner 支持 GQA（kv 头展开），详见 docs/phase2_lifecycle.md §6
+ZEALOT_E2E_MODEL=hf-internal-testing/tiny-random-gpt2 \
 ZEALOT_SITE_PACKAGES="$PWD/.venv/lib/python3.12/site-packages" \
 HF_ENDPOINT=https://hf-mirror.com \
 cargo test --test cpu_infer_e2e -- --nocapture
