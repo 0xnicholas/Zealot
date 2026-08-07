@@ -7,6 +7,15 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-②：约束解码参与真实 decode 路径（issue #16）——Sequence 携带 grammar
+  状态字段；`Engine::step` 采样前应用 allowed-token mask（`Sampler::sample_with_mask`，
+  mask 硬过滤优先于贪心/温度/top-k/p/penalty）；全屏蔽 fallback 为未约束采样
+  （tracing warn，不中断生成）；EOS 以 `is_valid_final` 门控（未达收尾状态强制
+  续写，可达则收尾 Stop）；grammar 状态随输出 token 推进（prefill 中间 chunk 不推进）
+- M5-①：required 收尾语义 + 静默吞错修复 + 递归 state_count（issue #15）——
+  `is_valid_final` 改为真状态机（state >= required.len()）；object/union 子
+  schema 编译失败整体报错（no-silent-failures）；`count_states` 递归计入嵌套，
+  max_states 检查上移到 compile_schema 层级覆盖嵌套/union 聚合
 - M4 收官：schema 缓存真 LRU（issue #12，§12-5）——原 HashMap 随机驱逐
   （`keys().next()`）修正为 `lru` 0.18 `LruCache`（O(1) 命中提升/淘汰，
   cache_size 上限）；`cache_size=0` 明确为禁用缓存；新增命中/未命中/淘汰

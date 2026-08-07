@@ -60,6 +60,10 @@ pub struct Sequence {
     blocks: Vec<BlockHandle>,
     /// Sampling parameters for this sequence.
     pub sampling_params: SamplingParams,
+    /// M5-②：JSON schema 约束 grammar（None = 未约束）。
+    pub grammar: Option<crate::constrained_decode::matcher::ConstrainedGrammar>,
+    /// grammar 当前状态（随输出 token 推进；未约束时为 0）。
+    pub grammar_state: usize,
     /// true = 下一步需要 prefill（初始，或被抢占后需 recompute）
     prefill_pending: bool,
     /// Current prefill position (in tokens).  Read by runners during
@@ -92,7 +96,18 @@ impl Sequence {
             prefill_pos: 0,
             chunk_size: 0,
             sampling_params,
+            grammar: None,
+            grammar_state: 0,
         }
+    }
+
+    /// 绑定 JSON schema 约束 grammar（M5-②）。
+    pub fn with_grammar(
+        mut self,
+        grammar: crate::constrained_decode::matcher::ConstrainedGrammar,
+    ) -> Self {
+        self.grammar = Some(grammar);
+        self
     }
 
     /// 总长度（prompt + 已生成）。被抢占的 seq 保留 output_tokens，

@@ -5,7 +5,7 @@
 //! 不感知模型实现（dev-mode PyTorch CPU / 目标 CUDA kernel）。
 
 use crate::error::ZealotError;
-use crate::sampling::Sampler;
+use crate::sampling::{Sampler, SamplingError};
 use crate::scheduler::{FinishReason, Scheduler, Sequence};
 use rand::Rng;
 use rand::SeedableRng;
@@ -161,13 +161,61 @@ impl Engine {
                     let seed = self.rng.gen::<u64>();
                     rand::rngs::StdRng::seed_from_u64(seed)
                 };
-                match self.sampler.sample(
-                    &logits,
-                    &seq.output_tokens,
-                    &seq.sampling_params,
-                    &mut req_rng,
-                ) {
-                    Ok(sampled) => sampled.token_id,
+                // M5-②：约束解码钩子——采样前按 grammar 当前状态构建 allowed-token mask。
+                let mask = seq.grammar.as_ref().map(|g| {
+                    let allowed = g.allowed_tokens_for(seq.grammar_state);
+                    let mut m = vec![false; logits.len()];
+                    for &t in &allowed {
+                        if t >= 0 && (t as usize) < m.len() {
+                            m[t as usize] = true;
+                        }
+                    }
+                    // EOS 门控：grammar 未达合法收尾状态时屏蔽 EOS（强制续写）；
+                    // 合法收尾后 EOS 放行（收尾）。
+                    if let Some(eos) = seq.eos_token_id {
+                        if eos >= 0
+                            && (eos as usize) < m.len()
+                            && !g.is_valid_final_state(seq.grammar_state)
+                        {
+                            m[eos as usize] = false;
+                        }
+                    }
+                    m
+                });
+                let sampled = match &mask {
+                    Some(m) => match self.sampler.sample_with_mask(
+                        &logits,
+                        &seq.output_tokens,
+                        &seq.sampling_params,
+                        &mut req_rng,
+                        Some(m),
+                    ) {
+                        Ok(s) => Ok(s),
+                        // fallback：约束把全部 token 屏蔽 → 退化为未约束采样（不中断生成）
+                        Err(SamplingError::AllTokensMasked) => {
+                            tracing::warn!(
+                                request_id = %seq.request_id,
+                                grammar_state = seq.grammar_state,
+                                "grammar mask exhausted all tokens; fallback to unconstrained sampling"
+                            );
+                            self.sampler.sample(
+                                &logits,
+                                &seq.output_tokens,
+                                &seq.sampling_params,
+                                &mut req_rng,
+                            )
+                        }
+                        Err(e) => Err(e),
+                    },
+                    None => self.sampler.sample(
+                        &logits,
+                        &seq.output_tokens,
+                        &seq.sampling_params,
+                        &mut req_rng,
+                    ),
+                };
+                match sampled {
+                    Ok(s) => s.token_id,
                     Err(_) => 0,
                 }
             } else {
@@ -176,6 +224,10 @@ impl Engine {
             let is_valid_output = !seq.is_prefill() || seq.is_final_chunk();
             if is_valid_output {
                 seq.output_tokens.push(token);
+                // grammar 状态仅在输出 token 落盘时推进（prefill 中间 chunk 不推进）
+                if let Some(g) = &seq.grammar {
+                    seq.grammar_state = g.advance_state(seq.grammar_state, token);
+                }
                 let text = step_out
                     .text
                     .or_else(|| self.tokenizer.as_ref().and_then(|t| t.decode_single(token)));
@@ -192,6 +244,11 @@ impl Engine {
             .filter_map(|seq| {
                 if seq.eos_token_id.is_some()
                     && seq.output_tokens.last() == seq.eos_token_id.as_ref()
+                    // M5-②：grammar 未达合法收尾时即使 EOS 落盘也强制续写
+                    && seq
+                        .grammar
+                        .as_ref()
+                        .is_none_or(|g| g.is_valid_final_state(seq.grammar_state))
                 {
                     Some((seq.request_id.clone(), FinishReason::Stop))
                 } else if seq.output_tokens.len() >= seq.max_tokens {
@@ -251,6 +308,31 @@ mod tests {
                 })
                 .collect())
         }
+    }
+
+    /// 逐次发 logits 的假 runner（走 Engine 侧采样路径）。
+    struct LogitRunner {
+        logits: VecDeque<Vec<f32>>,
+    }
+
+    impl ModelRunner for LogitRunner {
+        fn step(&mut self, batch: &mut [&mut Sequence]) -> Result<Vec<StepOut>, ZealotError> {
+            Ok(batch
+                .iter()
+                .map(|s| StepOut {
+                    request_id: s.request_id.clone(),
+                    token: None,
+                    logits: self.logits.pop_front(),
+                    text: None,
+                })
+                .collect())
+        }
+    }
+
+    fn biased_logits(size: usize, hot: i64, steps: usize) -> VecDeque<Vec<f32>> {
+        let mut l = vec![0.0_f32; size];
+        l[hot as usize] = 100.0;
+        VecDeque::from(vec![l; steps])
     }
 
     fn engine(tokens: Vec<i64>) -> Engine {
@@ -348,25 +430,6 @@ mod tests {
     /// Engine step loop and generates tokens.
     #[test]
     fn engine_samples_from_logits() {
-        use std::collections::VecDeque;
-
-        struct LogitRunner {
-            logits: VecDeque<Vec<f32>>,
-        }
-        impl ModelRunner for LogitRunner {
-            fn step(&mut self, batch: &mut [&mut Sequence]) -> Result<Vec<StepOut>, ZealotError> {
-                Ok(batch
-                    .iter()
-                    .map(|s| StepOut {
-                        request_id: s.request_id.clone(),
-                        token: None,
-                        logits: self.logits.pop_front(),
-                        text: None,
-                    })
-                    .collect())
-            }
-        }
-
         // Logits heavily biased toward token 42
         let mut logits: VecDeque<Vec<f32>> = VecDeque::new();
         for _ in 0..5 {
@@ -397,5 +460,142 @@ mod tests {
         // With temperature=0 (greedy), should always pick token 42
         assert_eq!(tokens, vec![42, 42, 42, 42, 42]);
         assert!(tokens.len() == 5);
+    }
+
+    // ── M5-②：约束解码钩子 ──────────────────────────────────────────────
+
+    use crate::constrained_decode::matcher::{ConstrainedGrammar, GrammarType};
+
+    #[test]
+    fn grammar_mask_applied_in_decode_loop() {
+        // Null grammar：只允许 n/u/l（ASCII 110/117/108）。模型强偏好 42 → 必须被屏蔽。
+        let grammar = ConstrainedGrammar::new(GrammarType::Null);
+        let logits = biased_logits(200, 42, 3);
+        let sched = Scheduler::new(SchedulerConfig::default()).unwrap();
+        let mut engine = Engine::new(sched, Box::new(LogitRunner { logits }));
+        let seq = engine
+            .scheduler_mut()
+            .make_sequence(
+                "g1".into(),
+                vec![1, 2],
+                3,
+                Priority::Medium,
+                None,
+                SamplingParams {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .with_grammar(grammar);
+        engine.scheduler_mut().add(seq);
+
+        let mut tokens = Vec::new();
+        while !engine.is_idle() {
+            let res = engine.step().unwrap();
+            tokens.extend(res.tokens.iter().map(|t| t.token));
+        }
+        assert_eq!(tokens.len(), 3);
+        assert!(
+            tokens.iter().all(|t| [108, 110, 117].contains(t)),
+            "所有 token 必须落在 grammar 允许集内，实际 {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn grammar_eos_gated_by_is_valid_final() {
+        // object {name: string}, required=[name]：state0 不可收尾 → EOS 屏蔽（强制续写）；
+        // state1 可收尾 → EOS 放行 → Stop。模型每一步都强偏好 EOS=99。
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            "name".to_string(),
+            GrammarType::String {
+                min_length: 1,
+                max_length: None,
+                pattern: None,
+                enum_values: None,
+            },
+        );
+        let grammar = ConstrainedGrammar::new(GrammarType::Object {
+            properties: props,
+            required: vec!["name".to_string()],
+            additional_properties: false,
+        });
+        assert_eq!(grammar.state_count(), 2);
+
+        let mut logits: VecDeque<Vec<f32>> = VecDeque::new();
+        for _ in 0..2 {
+            let mut l = vec![0.0_f32; 200];
+            l[99] = 100.0;
+            logits.push_back(l);
+        }
+        let sched = Scheduler::new(SchedulerConfig::default()).unwrap();
+        let mut engine = Engine::new(sched, Box::new(LogitRunner { logits }));
+        let seq = engine
+            .scheduler_mut()
+            .make_sequence(
+                "g2".into(),
+                vec![1, 2],
+                5,
+                Priority::Medium,
+                Some(99),
+                SamplingParams {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .with_grammar(grammar);
+        engine.scheduler_mut().add(seq);
+
+        let mut tokens = Vec::new();
+        let mut finished = Vec::new();
+        while !engine.is_idle() {
+            let res = engine.step().unwrap();
+            tokens.extend(res.tokens.iter().map(|t| t.token));
+            finished.extend(
+                res.finished
+                    .iter()
+                    .map(|f| (f.request_id.clone(), f.reason)),
+            );
+        }
+        assert_ne!(tokens[0], 99, "state0（未遍历 required）EOS 必须被屏蔽");
+        assert_eq!(tokens[1], 99, "state1（可收尾）EOS 放行");
+        assert_eq!(finished, vec![("g2".to_string(), FinishReason::Stop)]);
+        assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn grammar_all_masked_falls_back_to_unconstrained() {
+        // Union 无分支 → allowed 集合为空 → 全屏蔽 → AllTokensMasked →
+        // fallback 未约束采样（argmax=7），生成不中断。
+        let grammar = ConstrainedGrammar::new(GrammarType::Union { branches: vec![] });
+        assert_eq!(grammar.state_count(), 0);
+        let logits = biased_logits(100, 7, 2);
+        let sched = Scheduler::new(SchedulerConfig::default()).unwrap();
+        let mut engine = Engine::new(sched, Box::new(LogitRunner { logits }));
+        let seq = engine
+            .scheduler_mut()
+            .make_sequence(
+                "g3".into(),
+                vec![1, 2],
+                2,
+                Priority::Medium,
+                None,
+                SamplingParams {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .with_grammar(grammar);
+        engine.scheduler_mut().add(seq);
+
+        let mut tokens = Vec::new();
+        while !engine.is_idle() {
+            let res = engine.step().unwrap();
+            tokens.extend(res.tokens.iter().map(|t| t.token));
+        }
+        assert_eq!(tokens, vec![7, 7], "fallback 未约束采样应取 argmax");
     }
 }

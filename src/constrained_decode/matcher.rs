@@ -89,10 +89,10 @@ impl ConstrainedGrammar {
             ))
             .into());
         }
-        Ok(self.compute_allowed_tokens(state))
+        Ok(self.allowed_tokens_for(state))
     }
 
-    fn advance(&self, current_state: usize, _token_id: i32) -> PyResult<usize> {
+    fn advance(&self, current_state: usize, token_id: i32) -> PyResult<usize> {
         if current_state >= self.state_count {
             return Err(ZealotError::InvalidConstraint(format!(
                 "State {} out of range (max {})",
@@ -100,9 +100,7 @@ impl ConstrainedGrammar {
             ))
             .into());
         }
-        // For Phase 2: advance by cycling to next state within the grammar.
-        // Full token-id → grammar-position mapping requires tokenizer integration (Phase 3).
-        Ok((current_state + 1).min(self.state_count - 1))
+        Ok(self.advance_state(current_state, token_id as i64))
     }
 
     fn is_valid_final(&self, state: usize) -> PyResult<bool> {
@@ -113,11 +111,39 @@ impl ConstrainedGrammar {
             ))
             .into());
         }
-        Ok(self.compute_is_valid_final(state))
+        Ok(self.is_valid_final_state(state))
     }
 
     fn __repr__(&self) -> String {
         format!("ConstrainedGrammar(states={})", self.state_count)
+    }
+}
+
+impl ConstrainedGrammar {
+    /// 内部（非 PyO3）接口，供 Engine 采样钩子使用（M5-②）。
+    /// 越界防御性返回空集/原状态/false，由调用方（Engine）走 fallback。
+    /// 当前状态允许的 token 集合；越界返回空集。
+    pub fn allowed_tokens_for(&self, state: usize) -> Vec<i32> {
+        if state >= self.state_count {
+            return Vec::new();
+        }
+        self.compute_allowed_tokens(state)
+    }
+
+    /// 采样后推进状态（token 级）。越界返回原状态。
+    pub fn advance_state(&self, state: usize, _token_id: i64) -> usize {
+        if state >= self.state_count {
+            return state;
+        }
+        (state + 1).min(self.state_count - 1)
+    }
+
+    /// 当前状态是否可合法收尾（EOS 门控用）。越界返回 false。
+    pub fn is_valid_final_state(&self, state: usize) -> bool {
+        if state >= self.state_count {
+            return false;
+        }
+        self.compute_is_valid_final(state)
     }
 }
 

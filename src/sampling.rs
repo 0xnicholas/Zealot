@@ -58,10 +58,7 @@ pub struct SampledToken {
 pub struct Sampler;
 
 impl Sampler {
-    /// Run the full sampling pipeline.
-    ///
-    /// `prev_output_ids` is the sequence of tokens already generated
-    /// (used for penalty computation).  It can be empty during prefill.
+    /// Run the full sampling pipeline（无约束；委托 `sample_with_mask`，mask=None）。
     pub fn sample(
         &self,
         logits: &[f32],
@@ -69,24 +66,51 @@ impl Sampler {
         params: &SamplingParams,
         rng: &mut impl Rng,
     ) -> Result<SampledToken, SamplingError> {
+        self.sample_with_mask(logits, prev_output_ids, params, rng, None)
+    }
+
+    /// Run the full sampling pipeline with an optional allowed-token mask (M5-②).
+    ///
+    /// `mask[i] == false` → token `i` 硬屏蔽（置 `-inf`）。mask 在管线最前端
+    /// （贪心路径之前）应用：约束是硬过滤，不受 temperature/top-k/top-p/penalty 影响。
+    /// 全部被屏蔽 → `Err(AllTokensMasked)`。
+    pub fn sample_with_mask(
+        &self,
+        logits: &[f32],
+        prev_output_ids: &[i64],
+        params: &SamplingParams,
+        rng: &mut impl Rng,
+        mask: Option<&[bool]>,
+    ) -> Result<SampledToken, SamplingError> {
         if logits.is_empty() {
             return Err(SamplingError::EmptyLogits);
         }
 
+        // ── 0. Constraint mask（M5-②）：硬过滤原始 logits ─────────────────
+        let mut scores = logits.to_vec();
+        if let Some(mask) = mask {
+            for (i, s) in scores.iter_mut().enumerate() {
+                // 宽容语义：mask 短于 logits 时，超长部分视为允许（防御式，避免越界 panic）
+                if !mask.get(i).copied().unwrap_or(true) {
+                    *s = f32::NEG_INFINITY;
+                }
+            }
+            if scores.iter().all(|s| !s.is_finite()) {
+                return Err(SamplingError::AllTokensMasked);
+            }
+        }
+
         // ── 1. Greedy fast path (temperature ≈ 0) ─────────────────────────
         if params.temperature < 1e-7 {
-            let (max_idx, _) = argmax(logits);
-            let logprob = lightweight_logprob(logits, max_idx);
+            let (max_idx, _) = argmax(&scores);
+            let logprob = lightweight_logprob(&scores, max_idx);
             return Ok(SampledToken {
                 token_id: max_idx,
                 logprob,
             });
         }
 
-        // ── 2. Clone logits into mutable scores ───────────────────────────
-        let mut scores = logits.to_vec();
-
-        // ── 3. Temperature scaling ───────────────────────────────────────
+        // ── 2. Temperature scaling ───────────────────────────────────────
         if params.temperature != 1.0 {
             let inv_t = 1.0 / params.temperature;
             for s in &mut scores {
@@ -94,7 +118,7 @@ impl Sampler {
             }
         }
 
-        // ── 4/5. Presence + frequency penalties (merged pass) ────────────
+        // ── 3/4. Presence + frequency penalties (merged pass) ────────────
         // Presence penalty subtracts a flat amount per unique token; frequency
         // penalty subtracts (count × penalty). Both iterate prev_output_ids.
         // M5: Merge into one HashMap pass to halve iteration overhead.
@@ -120,7 +144,7 @@ impl Sampler {
             }
         }
 
-        // ── 6. Repetition penalty (multiplicative, per occurrence) ────────
+        // ── 5. Repetition penalty (multiplicative, per occurrence) ────────
         if params.repetition_penalty != 1.0 && !prev_output_ids.is_empty() {
             let pen = params.repetition_penalty;
             for &id in prev_output_ids {
@@ -135,7 +159,7 @@ impl Sampler {
             }
         }
 
-        // ── 7. Top-K filtering ────────────────────────────────────────────
+        // ── 6. Top-K filtering ────────────────────────────────────────────
         if params.top_k > 0 {
             let k = (params.top_k as usize).min(scores.len());
             if k < scores.len() {
@@ -155,7 +179,7 @@ impl Sampler {
             }
         }
 
-        // ── 8. Top-P (nucleus) filtering ──────────────────────────────────
+        // ── 7. Top-P (nucleus) filtering ──────────────────────────────────
         if params.top_p > 0.0 && params.top_p < 1.0 {
             let probs = softmax(&scores);
             let mut indexed: Vec<(f32, usize)> = probs
@@ -183,16 +207,16 @@ impl Sampler {
             }
         }
 
-        // ── 9. Softmax → probabilities ────────────────────────────────────
+        // ── 8. Softmax → probabilities ────────────────────────────────────
         let probs = softmax(&scores);
 
-        // ── 10. All-masked check ──────────────────────────────────────────
+        // ── 9. All-masked check ──────────────────────────────────────────
         let sum: f32 = probs.iter().sum();
         if sum == 0.0 || !sum.is_finite() {
             return Err(SamplingError::AllTokensMasked);
         }
 
-        // ── 11. Sample from multinomial ───────────────────────────────────
+        // ── 10. Sample from multinomial ───────────────────────────────────
         let token_idx = sample_multinomial(&probs, rng);
         let logprob = probs[token_idx].ln();
 
@@ -482,6 +506,83 @@ mod tests {
         let logits = vec![f32::NEG_INFINITY; 10];
         let err = sampler.sample(&logits, &[], &SamplingParams::default(), &mut rng());
         assert!(matches!(err, Err(SamplingError::AllTokensMasked)));
+    }
+
+    #[test]
+    fn mask_blocks_disallowed_tokens_greedy() {
+        let sampler = Sampler;
+        let logits = vec![1.0, 5.0, 3.0, 4.0];
+        let mask = vec![false, false, true, false]; // 只允许 token 2
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let result = sampler
+            .sample_with_mask(&logits, &[], &params, &mut rng(), Some(&mask))
+            .unwrap();
+        assert_eq!(result.token_id, 2);
+    }
+
+    #[test]
+    fn mask_applies_before_top_k() {
+        // top_k=1 正常选 argmax（index 1），但 mask 屏蔽它 → 必须在允许集中选最大
+        let sampler = Sampler;
+        let logits = vec![1.0, 100.0, 2.0, 3.0];
+        let mask = vec![true, false, true, true];
+        let params = SamplingParams {
+            top_k: 1,
+            ..Default::default()
+        };
+        let result = sampler
+            .sample_with_mask(&logits, &[], &params, &mut rng(), Some(&mask))
+            .unwrap();
+        assert_eq!(result.token_id, 3); // 允许集中 argmax = index 3 (3.0)
+    }
+
+    #[test]
+    fn mask_all_false_returns_all_tokens_masked() {
+        let sampler = Sampler;
+        let logits = vec![1.0, 2.0, 3.0];
+        let mask = vec![false, false, false];
+        let err = sampler.sample_with_mask(
+            &logits,
+            &[],
+            &SamplingParams::default(),
+            &mut rng(),
+            Some(&mask),
+        );
+        assert!(matches!(err, Err(SamplingError::AllTokensMasked)));
+    }
+
+    #[test]
+    fn mask_shorter_than_logits_defaults_allowed() {
+        // 宽容语义：mask 短于 logits 时，超长部分视为允许（防御式，避免越界 panic）。
+        let sampler = Sampler;
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let mask = vec![false, false, true]; // index 0/1 屏蔽；2、3、4 允许（含超长部分）
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let result = sampler
+            .sample_with_mask(&logits, &[], &params, &mut rng(), Some(&mask))
+            .unwrap();
+        assert_eq!(result.token_id, 4); // 允许集中 argmax = 5.0
+    }
+
+    #[test]
+    fn no_mask_matches_plain_sample() {
+        let sampler = Sampler;
+        let logits = vec![1.0, 2.0, 100.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let r1 = sampler.sample(&logits, &[], &params, &mut rng()).unwrap();
+        let r2 = sampler
+            .sample_with_mask(&logits, &[], &params, &mut rng(), None)
+            .unwrap();
+        assert_eq!(r1.token_id, r2.token_id);
     }
 
     #[test]
