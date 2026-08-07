@@ -137,6 +137,58 @@ fn schema_hash(schema_str: &str) -> u64 {
     h.finish()
 }
 
+/// M5-⑨（P2）：不支持的约束关键字——编译时显式报错，不静默忽略（unsupported > unsound）。
+/// 注解/元关键字（title/description/default/examples/readOnly/writeOnly/deprecated/
+/// $comment/$id/$schema/$defs/definitions/contentEncoding/contentMediaType）不约束值，放行。
+const UNSUPPORTED_KEYWORDS: &[&str] = &[
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "dependentRequired",
+    "uniqueItems",
+    "contains",
+    "minContains",
+    "maxContains",
+    "propertyNames",
+    "patternProperties",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "prefixItems",
+    "minProperties",
+    "maxProperties",
+    "const",
+    "$ref",
+    "allOf",
+];
+
+fn check_unsupported_keywords(schema: &JsonValue) -> Result<(), ZealotError> {
+    for &kw in UNSUPPORTED_KEYWORDS {
+        if schema.get(kw).is_some() {
+            return Err(ZealotError::SchemaCompileError(format!(
+                "关键字 `{kw}` 暂不支持（P2 显式报错，不静默忽略）"
+            )));
+        }
+    }
+    // additionalProperties 仅布尔形态；items 仅单 schema 对象形态（draft-07 tuple/布尔均不支持）
+    if let Some(ap) = schema.get("additionalProperties") {
+        if !ap.is_boolean() {
+            return Err(ZealotError::SchemaCompileError(
+                "additionalProperties 仅支持布尔形态（schema 形态暂不支持）".into(),
+            ));
+        }
+    }
+    if let Some(items) = schema.get("items") {
+        if !items.is_object() {
+            return Err(ZealotError::SchemaCompileError(
+                "items 仅支持单 schema 对象形态（tuple 数组/布尔形态暂不支持）".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn compile_schema(
     schema: &JsonValue,
     max_states: usize,
@@ -147,6 +199,8 @@ fn compile_schema(
             "Maximum nesting depth exceeded".into(),
         ));
     }
+
+    check_unsupported_keywords(schema)?;
 
     let grammar_type = if let Some(type_str) = schema.get("type").and_then(|t| t.as_str()) {
         match type_str {
@@ -762,9 +816,61 @@ mod tests {
         assert!(err.to_string().contains("pattern"), "{err}");
     }
 
+    // ── M5-⑨（P2）：不支持关键字显式报错 ─────────────────────────────────
+
+    #[test]
+    fn test_p2_unsupported_keywords_rejected() {
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        let cases = [
+            r#"{"not": {"type": "string"}}"#,
+            r#"{"if": {"type": "string"}, "then": {"minLength": 1}}"#,
+            r#"{"dependentSchemas": {"a": {"required": ["b"]}}}"#,
+            r#"{"dependentRequired": {"a": ["b"]}}"#,
+            r#"{"type": "array", "uniqueItems": true}"#,
+            r#"{"type": "array", "contains": {"type": "string"}}"#,
+            r#"{"type": "array", "minContains": 1}"#,
+            r#"{"type": "array", "maxContains": 3}"#,
+            r#"{"propertyNames": {"pattern": "^[a-z]+$"}}"#,
+            r#"{"patternProperties": {"^x": {"type": "string"}}}"#,
+            r#"{"unevaluatedProperties": false}"#,
+            r#"{"unevaluatedItems": false}"#,
+            r#"{"type": "array", "prefixItems": [{"type": "string"}]}"#,
+            r#"{"type": "object", "minProperties": 1}"#,
+            r#"{"type": "object", "maxProperties": 3}"#,
+            r#"{"const": "x"}"#,
+            r##"{"$ref": "#/$defs/x"}"##,
+            r#"{"allOf": [{"type": "string"}]}"#,
+            r#"{"type": "object", "additionalProperties": {"type": "string"}}"#,
+            r#"{"type": "array", "items": [{"type": "string"}, {"type": "number"}]}"#,
+            r#"{"type": "array", "items": false}"#,
+            // 嵌套传播：属性内不支持关键字 → 整体报错
+            r#"{"type": "object", "properties": {"a": {"not": {"type": "string"}}}}"#,
+        ];
+        for c in cases {
+            let err = compiler.compile(c, None).expect_err("应报错（P2 不静默）");
+            assert!(err.to_string().contains("暂不支持"), "{c}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_p2_annotation_keywords_allowed() {
+        // 注解/元关键字不约束值 → 放行
+        let compiler = JsonSchemaCompiler::new(16, 10000, 500);
+        let schema = r#"{
+            "type": "object",
+            "title": "t", "description": "d", "default": 1, "examples": [1, 2],
+            "readOnly": true, "writeOnly": false, "deprecated": false, "$comment": "c",
+            "$id": "x", "$schema": "http://json-schema.org/draft-07/schema#",
+            "$defs": {"a": {"type": "string"}},
+            "properties": {"x": {"type": "string", "title": "x", "description": "xd"}},
+            "required": ["x"], "additionalProperties": false
+        }"#;
+        let g = compiler.compile(schema, None).unwrap();
+        assert!(!g.automaton_rejected());
+    }
+
     #[test]
     fn test_integer_oversize_multiple_of_error() {
-        // 区间 + 大 multipleOf → 状态预算超限 → 编译错误
         let compiler = JsonSchemaCompiler::new(16, 10000, 500);
         let err = compiler
             .compile(

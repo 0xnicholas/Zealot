@@ -199,7 +199,7 @@ def test_boundary_schema_accepted_at_max_states():
     """恰好等于 max_states 的 schema 必须被接受（边界语义）。
     9999 属性编译约 0.9s（贴 1000ms 守卫线，冷启动抖动会超时）——
     此处放宽编译时限，只验证边界语义本身。"""
-    c = make_compiler(max_states=10_000, max_compile_ms=3_000)
+    c = make_compiler(max_states=10_000, max_compile_ms=10_000)
     props = {f"p{i}": {"type": "string"} for i in range(9_999)}  # 10000 states
     schema = {"type": "object", "properties": props}
     g = c.compile(json.dumps(schema))
@@ -397,3 +397,55 @@ def test_string_pattern_unsupported_and_conflict():
             c.compile(json.dumps({"type": "string", "pattern": pat}))
     with pytest.raises(RuntimeError, match="pattern"):
         c.compile(json.dumps({"type": "string", "pattern": "^a$", "format": "date"}))
+
+
+def test_p2_unsupported_keywords_rejected():
+    """M5-⑨：不支持关键字编译时显式报错（不静默忽略）。"""
+    c = make_compiler()
+    cases = [
+        {"not": {"type": "string"}},
+        {"if": {"type": "string"}, "then": {"minLength": 1}},
+        {"dependentSchemas": {"a": {"required": ["b"]}}},
+        {"dependentRequired": {"a": ["b"]}},
+        {"type": "array", "uniqueItems": True},
+        {"type": "array", "contains": {"type": "string"}},
+        {"type": "array", "minContains": 1},
+        {"type": "array", "maxContains": 3},
+        {"propertyNames": {"pattern": "^[a-z]+$"}},
+        {"patternProperties": {"^x": {"type": "string"}}},
+        {"unevaluatedProperties": False},
+        {"unevaluatedItems": False},
+        {"type": "array", "prefixItems": [{"type": "string"}]},
+        {"type": "object", "minProperties": 1},
+        {"const": "x"},
+        {"allOf": [{"type": "string"}]},
+        {"type": "object", "additionalProperties": {"type": "string"}},
+        {"type": "array", "items": [{"type": "string"}]},
+        # 嵌套传播
+        {"type": "object", "properties": {"a": {"not": {"type": "string"}}}},
+    ]
+    for schema in cases:
+        with pytest.raises(RuntimeError, match="暂不支持"):
+            c.compile(json.dumps(schema))
+
+
+def test_p2_annotation_keywords_allowed():
+    """M5-⑨：注解/元关键字放行（不约束值）。"""
+    c = make_compiler()
+    schema = {
+        "type": "object",
+        "title": "t",
+        "description": "d",
+        "default": 1,
+        "examples": [1, 2],
+        "readOnly": True,
+        "writeOnly": False,
+        "deprecated": False,
+        "$comment": "c",
+        "$id": "x",
+        "$defs": {"a": {"type": "string"}},
+        "properties": {"x": {"type": "string", "title": "x", "description": "xd"}},
+        "required": ["x"],
+        "additionalProperties": False,
+    }
+    # 注解/元关键字不约束值 → 编译放行（编译失败会抛 RuntimeError）

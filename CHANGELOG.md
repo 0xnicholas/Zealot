@@ -7,6 +7,16 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-⑨（P2）：不支持关键字显式报错（issue #23）——compile_schema 统一守卫：
+  `not`/`if`/`then`/`else`/`dependentSchemas`/`dependentRequired`/`uniqueItems`/
+  `contains`/`minContains`/`maxContains`/`propertyNames`/`patternProperties`/
+  `unevaluatedProperties`/`unevaluatedItems`/`prefixItems`/`minProperties`/
+  `maxProperties`/`const`/`$ref`/`allOf` → 编译报错「暂不支持」（unsupported >
+  unsound，不再静默降级 Any）；`additionalProperties` 仅布尔形态、`items` 仅单
+  schema 形态（tuple 数组/布尔拒绝）；嵌套属性内同样生效（整体传播）；注解/
+  元关键字（title/description/default/examples/readOnly/writeOnly/deprecated/
+  $comment/$id/$schema/$defs/definitions/contentEncoding/contentMediaType）
+  不约束值 → 放行
 - M5-⑧：string pattern 执行（issue #22）——新 regex.rs 引擎：解析（字面量/字符类/
   `.`/转义 `\d\w\s` 等/量词 `*+?{n,m}`/分组/交替）→ Thompson NFA → 子集构造
   DFA → 死状态剪枝；**锚定语义**（业界惯例：llama.cpp 要求 ^…$、outlines #1083）——
