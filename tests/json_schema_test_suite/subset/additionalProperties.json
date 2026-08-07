@@ -1,0 +1,22 @@
+[
+ {
+  "description": "additionalProperties are allowed by default",
+  "schema": {
+   "properties": {
+    "foo": {},
+    "bar": {}
+   }
+  },
+  "tests": [
+   {
+    "description": "additional properties are allowed",
+    "data": {
+     "foo": 1,
+     "bar": 2,
+     "quux": true
+    },
+    "valid": true
+   }
+  ]
+ }
+]

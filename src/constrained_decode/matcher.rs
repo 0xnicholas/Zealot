@@ -178,8 +178,9 @@ impl ConstrainedGrammar {
 
 fn count_states(gt: &GrammarType) -> usize {
     match gt {
-        GrammarType::Any
-        | GrammarType::String { .. }
+        // Any = 任意 JSON 环骨架（M5-⑩）：3 派发 + 3 套叶子 + 对象/数组骨架 ≈ 64
+        GrammarType::Any => 64,
+        GrammarType::String { .. }
         | GrammarType::Number
         | GrammarType::Integer { .. }
         | GrammarType::Boolean
@@ -370,12 +371,6 @@ impl AutoBuilder {
         self.states[s].stay[(b >> 3) as usize] &= !(1 << (b & 7));
     }
 
-    fn add_stay_range(&mut self, s: usize, lo: u8, hi: u8) {
-        for b in lo..=hi {
-            self.add_stay(s, b);
-        }
-    }
-
     fn add_ws(&mut self, s: usize) {
         for &w in &WS_BYTES {
             self.add_stay(s, w);
@@ -420,13 +415,9 @@ impl AutoBuilder {
     fn compile_value(&mut self, gt: &GrammarType) -> Result<AutoOut, ZealotError> {
         let out = match gt {
             GrammarType::Any => {
-                let s = self.new_state()?;
-                self.add_stay_range(s, 0, 255);
-                self.set_final(s);
-                AutoOut {
-                    start: s,
-                    exits: vec![s],
-                }
+                // M5-⑩（套件修复）：任意 JSON 值用结构骨架 + 状态环，
+                // 不用「吸收一切字节」的单状态（会吞掉 `,`/`}`/`]` 绕过 required/minItems 门）。
+                self.build_any_json()?
             }
             GrammarType::String {
                 min_length,
@@ -632,19 +623,11 @@ impl AutoBuilder {
                 }
             }
             GrammarType::Enum { values } => {
+                // M5-⑩（套件修复）：成员统一走 serde_json 序列化（字符串成员
+                // 也转义控制字符——原始字节会与数据的转义形态不匹配，不可达）。
                 let lits: Vec<Vec<u8>> = values
                     .iter()
-                    .map(|v| match v {
-                        JsonValue::String(s) => {
-                            let mut b = vec![b'"'];
-                            b.extend_from_slice(s.as_bytes());
-                            b.push(b'"');
-                            b
-                        }
-                        other => serde_json::to_string(other)
-                            .unwrap_or_default()
-                            .into_bytes(),
-                    })
+                    .map(|v| serde_json::to_string(v).unwrap_or_default().into_bytes())
                     .collect();
                 let refs: Vec<&[u8]> = lits.iter().map(|v| v.as_slice()).collect();
                 let (start, mut ends) = self.literal_trie(&refs)?;
@@ -656,8 +639,8 @@ impl AutoBuilder {
             GrammarType::Object {
                 properties,
                 required,
-                ..
-            } => self.compile_object(properties, required)?,
+                additional_properties,
+            } => self.compile_object(properties, required, *additional_properties)?,
             GrammarType::Array {
                 min_items,
                 max_items,
@@ -684,6 +667,124 @@ impl AutoBuilder {
         Ok(out)
     }
 
+    /// 任意 JSON 的叶子集（string/number/boolean/null，无结构骨架）。
+    fn any_leaf_set(&mut self) -> Result<(Vec<usize>, Vec<usize>), ZealotError> {
+        let plain = GrammarType::String {
+            min_length: 0,
+            max_length: None,
+            pattern: None,
+            enum_values: None,
+            format: None,
+        };
+        let mut starts = Vec::new();
+        let mut ends = Vec::new();
+        for gt in [
+            plain,
+            GrammarType::Number,
+            GrammarType::Boolean,
+            GrammarType::Null,
+        ] {
+            let o = self.compile_value(&gt)?;
+            starts.push(o.start);
+            ends.extend(o.exits);
+        }
+        Ok((starts, ends))
+    }
+
+    /// M5-⑩：任意 JSON 值自动机（JSON Schema Test Suite 子集暴露的修复）。
+    ///
+    /// 原实现是「吸收一切字节」的单状态——它会把 `,`/`}`/`]` 也吞掉，绕过
+    /// required/minItems 门（`{"bar":1}` 在 required foo 时被判合法）→ 换成
+    /// 结构骨架 + 状态环（编译无递归）：
+    ///
+    ///   入口（纯分支派发）：v_top（顶层）/ v_kv（任意对象值）/ v_item（任意数组元素）
+    ///     分支：string / number / boolean / null / 对象骨架 / 数组骨架
+    ///   对象骨架：`{`→kv0；kv0：`}`→oc（空对象）| `"`→键汤；`,` 后 kvn 只有 `"`→键汤
+    ///     （杜绝尾逗号）；键汤 0x20..=0xFF 除 `"`；`"`→ke→`:`→v_kv
+    ///   数组骨架：`[`→item0；item0：`]`→ac（空数组）| 值；`,` 后 itemn 只有值
+    ///   三套叶子：top（纯出口——父级 required/minItems 门不被绕过）、
+    ///     kv（出口接 `,`→kvn / `}`→oc）、item（出口接 `,`→itemn / `]`→ac）
+    ///   嵌套任意结构经 2-环（v_kv → 数组骨架 → v_item → 对象骨架 → v_kv）表达。
+    fn build_any_json(&mut self) -> Result<AutoOut, ZealotError> {
+        let (t_s, t_e) = self.any_leaf_set()?;
+        let (k_s, k_e) = self.any_leaf_set()?;
+        let (i_s, i_e) = self.any_leaf_set()?;
+
+        let v_top = self.new_state()?;
+        self.boundary(v_top);
+        let v_kv = self.new_state()?;
+        self.boundary(v_kv);
+        let v_item = self.new_state()?;
+        self.boundary(v_item);
+
+        // 对象骨架
+        let oc = self.new_state()?;
+        self.set_final(oc);
+        let kv0 = self.new_state()?;
+        self.boundary(kv0);
+        let kvn = self.new_state()?;
+        self.boundary(kvn);
+        let ks = self.new_state()?;
+        self.boundary(ks);
+        let ke = self.new_state()?;
+        self.boundary(ke);
+        let obj_open = self.new_state()?;
+        self.boundary(obj_open);
+        self.add_edge(obj_open, b'{', kv0);
+        self.add_edge(kv0, b'}', oc);
+        self.add_edge(kv0, b'"', ks);
+        self.add_edge(kvn, b'"', ks);
+        for b in 0x20u8..=0xFFu8 {
+            if b != b'"' {
+                self.add_stay(ks, b);
+            }
+        }
+        self.add_edge(ks, b'"', ke);
+        self.add_edge(ke, b':', v_kv);
+
+        // 数组骨架
+        let ac = self.new_state()?;
+        self.set_final(ac);
+        let item0 = self.new_state()?;
+        self.boundary(item0);
+        let itemn = self.new_state()?;
+        self.boundary(itemn);
+        let arr_open = self.new_state()?;
+        self.boundary(arr_open);
+        self.add_edge(arr_open, b'[', item0);
+        self.add_edge(item0, b']', ac);
+        self.states[item0].union_branches = Some(vec![v_item]);
+        self.states[itemn].union_branches = Some(vec![v_item]);
+
+        // 分支派发（边/stay 优先；派发状态无自身边）
+        for (v, mut starts) in [(v_top, t_s), (v_kv, k_s), (v_item, i_s)] {
+            starts.push(obj_open);
+            starts.push(arr_open);
+            self.states[v].union_branches = Some(starts);
+        }
+
+        // 值出口接线（内部上下文；顶层叶子无内部边）
+        for &e in &k_e {
+            self.add_ws(e);
+            self.add_edge(e, b',', kvn);
+            self.add_edge(e, b'}', oc);
+        }
+        for &e in &i_e {
+            self.add_ws(e);
+            self.add_edge(e, b',', itemn);
+            self.add_edge(e, b']', ac);
+        }
+
+        // 顶层出口：top 叶子终点 + oc + ac（ws 由 compile_value 统一加）
+        let mut exits = t_e;
+        exits.push(oc);
+        exits.push(ac);
+        Ok(AutoOut {
+            start: v_top,
+            exits,
+        })
+    }
+
     /// Object：required 用计数器状态 k 表达（k = 下一个未满足的 required 键下标）。
     /// 注意：required 键须**按 required 数组顺序**生成——乱序出现不推进计数器
     /// （需按序重发）。生成侧（mask 驱动）天然可控，文档化此约束。
@@ -692,9 +793,9 @@ impl AutoBuilder {
         &mut self,
         properties: &HashMap<String, GrammarType>,
         required: &[String],
+        additional_properties: bool,
     ) -> Result<AutoOut, ZealotError> {
         let mut keys: Vec<&String> = properties.keys().collect();
-        keys.sort();
         // required 去重保序（重复 required 键会让计数器双进）
         let mut req: Vec<&String> = Vec::new();
         for k in required {
@@ -702,6 +803,13 @@ impl AutoBuilder {
                 req.push(k);
             }
         }
+        // M5-⑩：required 键未在 properties 中声明时也须有链（值 = 任意 JSON）
+        for k in &req {
+            if !keys.contains(k) {
+                keys.push(k);
+            }
+        }
+        keys.sort();
         let r = req.len();
 
         let done = self.new_state()?;
@@ -726,8 +834,17 @@ impl AutoBuilder {
                 .copied()
                 .filter(|n| !req[..k].contains(n))
                 .collect();
+            let mut k_chain_states = Vec::new();
             for name in &eligible {
-                let leaf = self.chain_from(key_root[k], name.as_bytes())?;
+                // M5-⑩：键链用 JSON 转义字节（控制字符/引号键名的序列化形态与数据一致）
+                let key_bytes = serde_json::to_string(name.as_str())
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        b[1..b.len() - 1].to_vec()
+                    })
+                    .unwrap_or_else(|_| name.as_bytes().to_vec());
+                let mut chain_states = Vec::new();
+                let leaf = self.chain_from_track(key_root[k], &key_bytes, &mut chain_states)?;
                 let ak = self.new_state()?;
                 self.boundary(ak);
                 let vpos = self.new_state()?;
@@ -741,13 +858,58 @@ impl AutoBuilder {
                 };
                 // 值 grammar（按 (k,name) 复制：出口目标与 k 绑定）。
                 // vpos 用分支语义派发：首字节由 sub.start 自身的转移消费（避免双消费）
-                let sub = self.compile_value(&properties[*name])?;
+                let sub = self.compile_value(properties.get(*name).unwrap_or(&GrammarType::Any))?;
                 self.states[vpos].union_branches = Some(vec![sub.start]);
                 // 值出口：`,` → 下一键起始（k2）；`}` 仅在 k2 == r（全部 required 已满足）
+                // M5-⑩：`,` 仅当 k2 处仍有键（未排除的 optional / extra）——
+                // 否则尾逗号是可达而死路径（reachable-but-dead，issue #19 原则），
+                // 生成侧会卡死在 `,` 后的空键位。
+                let comma_viable =
+                    additional_properties || keys.iter().any(|n| !req[..k2].contains(n));
                 for &e in &sub.exits {
-                    self.add_edge(e, b',', trie_root[k2]);
+                    if comma_viable {
+                        self.add_edge(e, b',', trie_root[k2]);
+                    }
                     if k2 == r {
                         self.add_edge(e, b'}', done);
+                    }
+                }
+                k_chain_states.extend(chain_states);
+            }
+            // M5-⑩：additionalProperties=true → 任意键路径：键汤
+            // （stay 0x20..=0xFF 除 `"`）→ `"`→eke → `:`→evp → 任意值 →
+            // `,`→trie_root[k] / `}`（仅 k==r，required 门不被绕过）。
+            // 分支挂 key_root[k] 与全部键链状态（前缀冲突的额外键也可达）。
+            if additional_properties {
+                let eks = self.new_state()?;
+                self.boundary(eks);
+                let eke = self.new_state()?;
+                self.boundary(eke);
+                let evp = self.new_state()?;
+                self.boundary(evp);
+                for b in 0x20u8..=0xFFu8 {
+                    if b != b'"' {
+                        self.add_stay(eks, b);
+                    }
+                }
+                self.add_edge(eks, b'"', eke);
+                self.add_edge(eke, b':', evp);
+                let ev = self.compile_value(&GrammarType::Any)?;
+                self.states[evp].union_branches = Some(vec![ev.start]);
+                for &e in &ev.exits {
+                    self.add_edge(e, b',', trie_root[k]);
+                    if k == r {
+                        self.add_edge(e, b'}', done);
+                    }
+                }
+                for &cs in std::iter::once(&key_root[k]).chain(k_chain_states.iter()) {
+                    let br = &mut self.states[cs].union_branches;
+                    if let Some(v) = br {
+                        if !v.contains(&eks) {
+                            v.push(eks);
+                        }
+                    } else {
+                        *br = Some(vec![eks]);
                     }
                 }
             }
@@ -1417,7 +1579,13 @@ impl AutoBuilder {
         Ok(cur)
     }
 
-    fn chain_from(&mut self, cur: usize, bytes: &[u8]) -> Result<usize, ZealotError> {
+    /// 字面量链（前缀共享）；沿途状态记录到 out（额外键分支挂载用）。
+    fn chain_from_track(
+        &mut self,
+        cur: usize,
+        bytes: &[u8],
+        out: &mut Vec<usize>,
+    ) -> Result<usize, ZealotError> {
         let mut c = cur;
         for &b in bytes {
             let next = match self.states[c].edges.iter().find(|(bb, _)| *bb == b) {
@@ -1429,6 +1597,7 @@ impl AutoBuilder {
                 }
             };
             c = next;
+            out.push(c);
         }
         Ok(c)
     }

@@ -7,6 +7,18 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-⑩：集成测试（issue #24）——JSON Schema Test Suite（draft-07）子集纳入回归：
+  151 用例 / 9 文件 vendor 进 tests/json_schema_test_suite/（subset/ + SUBSET.md 排除
+  记录 + pytest runner 152 项）；排除均系设计性差异（无 type 约束关键字报错、P2
+  关键字、properties 无 type 按 object 推断、数值表示等价、oneOf=并集、pattern
+  锚定、multipleOf 上限）
+  - **套件暴露的自动机修复**：① Any「字节汤」吞结构字节绕过 required/minItems 门
+    → 重构为「结构骨架 + 2-环」任意 JSON 自动机（build_any_json，顶层/对象/数组
+    三套叶子，嵌套任意结构经状态环表达，编译无递归）；② additionalProperties=true
+    无任意键路径 → 键汤 + 任意键分支（含键链中途折入，前缀冲突键可达）；③ 键链/枚举
+    成员用原始字节（转义键名/控制字符不可达）→ 统一 serde_json 序列化字节；④
+    `{"required": [...]}` 无 type/properties 静默降级 Any → 按 object 推断，required
+    键未声明时补链；⑤ 尾逗号可达而死路径 → k2 无剩余键且 additional=false 时剪 `,` 边
 - M5-⑨（P2）：不支持关键字显式报错（issue #23）——compile_schema 统一守卫：
   `not`/`if`/`then`/`else`/`dependentSchemas`/`dependentRequired`/`uniqueItems`/
   `contains`/`minContains`/`maxContains`/`propertyNames`/`patternProperties`/

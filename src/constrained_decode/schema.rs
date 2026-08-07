@@ -163,6 +163,22 @@ const UNSUPPORTED_KEYWORDS: &[&str] = &[
     "allOf",
 ];
 
+/// 无 type 时无法约束的类型相关关键字（M5-⑩：套件多为无 type 形态——不静默降级）。
+const UNTYPED_KEYWORD_REQUIREMENT: &[(&str, &str)] = &[
+    ("multipleOf", "integer"),
+    ("minimum", "integer"),
+    ("maximum", "integer"),
+    ("exclusiveMinimum", "integer"),
+    ("exclusiveMaximum", "integer"),
+    ("minLength", "string"),
+    ("maxLength", "string"),
+    ("pattern", "string"),
+    ("format", "string"),
+    ("minItems", "array"),
+    ("maxItems", "array"),
+    ("items", "array"),
+];
+
 fn check_unsupported_keywords(schema: &JsonValue) -> Result<(), ZealotError> {
     for &kw in UNSUPPORTED_KEYWORDS {
         if schema.get(kw).is_some() {
@@ -186,6 +202,38 @@ fn check_unsupported_keywords(schema: &JsonValue) -> Result<(), ZealotError> {
             ));
         }
     }
+    // type 形态 + type 与 anyOf/oneOf 组合（交集无法表达 → 报错）
+    if let Some(t) = schema.get("type") {
+        let ok = matches!(
+            t.as_str(),
+            Some("string" | "number" | "integer" | "boolean" | "null" | "object" | "array")
+        );
+        if !ok {
+            return Err(ZealotError::SchemaCompileError(
+                "type 仅支持单字符串形态（数组/布尔/未知类型暂不支持）".into(),
+            ));
+        }
+        if schema.get("anyOf").is_some() || schema.get("oneOf").is_some() {
+            return Err(ZealotError::SchemaCompileError(
+                "type 与 anyOf/oneOf 组合（交集语义）暂不支持".into(),
+            ));
+        }
+    } else {
+        // 无 type：类型相关关键字无法约束——不静默忽略（unsupported > unsound）
+        for &(kw, ty) in UNTYPED_KEYWORD_REQUIREMENT {
+            if schema.get(kw).is_some() {
+                return Err(ZealotError::SchemaCompileError(format!(
+                    "关键字 {kw} 需与 type: {ty} 搭配（无类型 schema 无法约束，暂不支持静默忽略）"
+                )));
+            }
+        }
+        if schema.get("additionalProperties").is_some() && schema.get("properties").is_none() {
+            return Err(ZealotError::SchemaCompileError(
+                "additionalProperties 需与 type: object 或 properties 搭配（暂不支持静默忽略）"
+                    .into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -198,6 +246,23 @@ fn compile_schema(
         return Err(ZealotError::SchemaCompileError(
             "Maximum nesting depth exceeded".into(),
         ));
+    }
+
+    // 布尔 schema：true = 任意值，false = 空语言（永不合格）
+    if let Some(b) = schema.as_bool() {
+        let g = if b {
+            GrammarType::Any
+        } else {
+            GrammarType::Union { branches: vec![] }
+        };
+        let grammar = ConstrainedGrammar::new(g);
+        if grammar.state_count() > max_states {
+            return Err(ZealotError::SchemaTooComplex {
+                states: grammar.state_count(),
+                limit: max_states,
+            });
+        }
+        return Ok(grammar);
     }
 
     check_unsupported_keywords(schema)?;
@@ -229,7 +294,8 @@ fn compile_schema(
         }
     } else if schema.get("enum").is_some() {
         compile_enum(schema, max_states, depth)?
-    } else if schema.get("properties").is_some() {
+    } else if schema.get("properties").is_some() || schema.get("required").is_some() {
+        // M5-⑩：仅含 required（无 properties/type）也按 object 推断（否则静默降级 Any）
         compile_object(schema, max_states, depth)?
     } else if schema.get("anyOf").is_some() || schema.get("oneOf").is_some() {
         compile_union(schema, max_states, depth)?

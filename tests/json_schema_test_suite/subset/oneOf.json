@@ -1,0 +1,235 @@
+[
+ {
+  "description": "oneOf with boolean schemas, one true",
+  "schema": {
+   "oneOf": [
+    true,
+    false,
+    false
+   ]
+  },
+  "tests": [
+   {
+    "description": "any value is valid",
+    "data": "foo",
+    "valid": true
+   }
+  ]
+ },
+ {
+  "description": "oneOf with boolean schemas, all false",
+  "schema": {
+   "oneOf": [
+    false,
+    false,
+    false
+   ]
+  },
+  "tests": [
+   {
+    "description": "any value is invalid",
+    "data": "foo",
+    "valid": false
+   }
+  ]
+ },
+ {
+  "description": "oneOf complex types",
+  "schema": {
+   "oneOf": [
+    {
+     "properties": {
+      "bar": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "bar"
+     ]
+    },
+    {
+     "properties": {
+      "foo": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "foo"
+     ]
+    }
+   ]
+  },
+  "tests": [
+   {
+    "description": "first oneOf valid (complex)",
+    "data": {
+     "bar": 2
+    },
+    "valid": true
+   }
+  ]
+ },
+ {
+  "description": "oneOf complex types",
+  "schema": {
+   "oneOf": [
+    {
+     "properties": {
+      "bar": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "bar"
+     ]
+    },
+    {
+     "properties": {
+      "foo": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "foo"
+     ]
+    }
+   ]
+  },
+  "tests": [
+   {
+    "description": "neither oneOf valid (complex)",
+    "data": {
+     "foo": 2,
+     "bar": "quux"
+    },
+    "valid": false
+   }
+  ]
+ },
+ {
+  "description": "oneOf with empty schema",
+  "schema": {
+   "oneOf": [
+    {
+     "type": "number"
+    },
+    {}
+   ]
+  },
+  "tests": [
+   {
+    "description": "one valid - valid",
+    "data": "foo",
+    "valid": true
+   }
+  ]
+ },
+ {
+  "description": "oneOf with missing optional property",
+  "schema": {
+   "oneOf": [
+    {
+     "properties": {
+      "bar": true,
+      "baz": true
+     },
+     "required": [
+      "bar"
+     ]
+    },
+    {
+     "properties": {
+      "foo": true
+     },
+     "required": [
+      "foo"
+     ]
+    }
+   ]
+  },
+  "tests": [
+   {
+    "description": "first oneOf valid",
+    "data": {
+     "bar": 8
+    },
+    "valid": true
+   }
+  ]
+ },
+ {
+  "description": "oneOf with missing optional property",
+  "schema": {
+   "oneOf": [
+    {
+     "properties": {
+      "bar": true,
+      "baz": true
+     },
+     "required": [
+      "bar"
+     ]
+    },
+    {
+     "properties": {
+      "foo": true
+     },
+     "required": [
+      "foo"
+     ]
+    }
+   ]
+  },
+  "tests": [
+   {
+    "description": "neither oneOf valid",
+    "data": {
+     "baz": "quux"
+    },
+    "valid": false
+   }
+  ]
+ },
+ {
+  "description": "nested oneOf, to check validation semantics",
+  "schema": {
+   "oneOf": [
+    {
+     "oneOf": [
+      {
+       "type": "null"
+      }
+     ]
+    }
+   ]
+  },
+  "tests": [
+   {
+    "description": "null is valid",
+    "data": null,
+    "valid": true
+   }
+  ]
+ },
+ {
+  "description": "nested oneOf, to check validation semantics",
+  "schema": {
+   "oneOf": [
+    {
+     "oneOf": [
+      {
+       "type": "null"
+      }
+     ]
+    }
+   ]
+  },
+  "tests": [
+   {
+    "description": "anything non-null is invalid",
+    "data": 123,
+    "valid": false
+   }
+  ]
+ }
+]

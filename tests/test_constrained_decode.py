@@ -449,3 +449,58 @@ def test_p2_annotation_keywords_allowed():
         "additionalProperties": False,
     }
     # 注解/元关键字不约束值 → 编译放行（编译失败会抛 RuntimeError）
+
+
+def test_greedy_decode_e2e(tmp_path):
+    """M5-⑩：compile → mask → sample 全链路模拟（256 字节词表 + 最小 id 贪婪）。
+
+    与 tests/grammar_e2e.rs 的 mock:tiny 引擎用例同构：每个位置在 mask 中取
+    最小 id 的 token，直到自动机终态——确定性输出可断言。
+    """
+    vocab = {chr(i): i for i in range(256)}
+    tok_path = tmp_path / "tokenizer.json"
+    tok_path.write_text(json.dumps({"model": {"type": "BPE", "vocab": vocab}}))
+    c = make_compiler()
+
+    def decode(schema, budget=200):
+        g = c.compile(json.dumps(schema))
+        g.load_tokenizer(str(tok_path))
+        st, out = 0, []
+        for _ in range(budget):
+            # 最小 id 胜出（同 mock logits 偏好）；排除 ws/控制字节——真实词表
+            # 不含它们（mock:tiny 无 ws token；控制字节 JSON 需转义，空白是
+            # 可选路径而非必经），模拟避免 ws/控制字节自旋
+            allowed = sorted(a for a in g.allowed_tokens(st) if a >= 0x20 and a not in (9, 10, 13, 32))
+            if not allowed:
+                return bytes(out), st  # mask 清空 → eos 强推（引擎收尾语义）
+            b = allowed[0]
+            out.append(b)
+            st = g.advance(st, b)
+        raise AssertionError(f"未收尾: {bytes(out)!r}")
+
+    # 对象 + required + 枚举（M5-④ 信封）；字节词表 'f'=102 < 't'=116 → "false" 胜出
+    text, _ = decode({
+        "type": "object",
+        "properties": {"name": {"enum": ["true", "false"]}},
+        "required": ["name"],
+        "additionalProperties": False,
+    })
+    assert text == b'{"name":"false"}'
+
+    # integer 范围（M5-⑤）：字节词表 '0'=48 < '1'=49 → 取 '0'（最小 id）
+    text, _ = decode({
+        "type": "object",
+        "properties": {"age": {"type": "integer", "minimum": 0, "maximum": 1}},
+        "required": ["age"],
+        "additionalProperties": False,
+    })
+    assert text == b'{"age":0}'
+
+    # string 长度（M5-⑥）：minLength 2 内 "!!" 不可收，续到 maxLength 3 → "!!!"
+    # （字节词表最小可打印 id 33='!' 胜出）
+    text, _ = decode({"type": "string", "minLength": 2, "maxLength": 3})
+    assert text == b'"!!!"'
+
+    # pattern 锚定（M5-⑧）：^abc$ 确定性（贪心无环）
+    text, _ = decode({"type": "string", "pattern": "^abc$"})
+    assert text == b'"abc"'

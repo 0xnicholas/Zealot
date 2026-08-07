@@ -2,8 +2,8 @@ pub mod matcher;
 pub mod regex;
 pub mod schema;
 
-use self::matcher::ConstrainedGrammar;
-use self::schema::JsonSchemaCompiler;
+pub use self::matcher::ConstrainedGrammar;
+pub use self::schema::JsonSchemaCompiler;
 use pyo3::prelude::*;
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
