@@ -1,6 +1,7 @@
 """M4 §9: JsonSchemaCompiler / ConstrainedGrammar PyO3 接口 + 对抗性 schema 拒绝。
 
 §12-6 覆盖：构造 >10000 states 的 schema → SchemaTooComplex（RuntimeError）。
+§12-5 覆盖：缓存命中/淘汰统计 + 真 LRU 淘汰顺序（见 test_cache_lru_eviction）。
 运行：`pytest tests/`（前置：`.venv/bin/maturin develop` 安装扩展）。
 """
 
@@ -48,8 +49,36 @@ def test_compile_cache_hit_and_bypass():
     g1 = c.compile(json.dumps(SIMPLE))
     g2 = c.compile(json.dumps(SIMPLE))  # 命中缓存
     assert g2.state_count == g1.state_count
-    g3 = c.compile(json.dumps(SIMPLE), bypass_cache=True)  # 绕过缓存
+    assert c.cache_misses == 1
+    assert c.cache_hits == 1
+    assert c.cache_evictions == 0
+    g3 = c.compile(json.dumps(SIMPLE), bypass_cache=True)  # 绕过缓存：不查不写不计
     assert g3.state_count == g1.state_count
+    assert c.cache_hits == 1
+    assert c.cache_misses == 1
+
+
+def test_cache_lru_eviction():
+    """§12-5：cache_size=2 下 A,B,A(命中提升),C → 必须淘汰 B（最久未用），保留 A。"""
+    c = ze.JsonSchemaCompiler(2, 10_000, 1000)
+    a = {"type": "string", "minLength": 1}
+    b = {"type": "integer"}
+    d = {"type": "boolean"}
+
+    c.compile(json.dumps(a))  # miss
+    c.compile(json.dumps(b))  # miss
+    c.compile(json.dumps(a))  # hit → A 提升为最近使用
+    c.compile(json.dumps(d))  # miss → 容量满，淘汰最久未用的 B
+    assert c.cache_evictions == 1
+    assert c.cache_hits == 1
+    assert c.cache_misses == 3
+
+    # 先验证 A 存活（hit），再重编译 B：若 B 未真被淘汰此处应为 hit
+    c.compile(json.dumps(a))  # hit → 证明被淘汰的是 B 而非 A
+    c.compile(json.dumps(b))  # miss → 证明 B 确实已被淘汰（同时把当时最久未用的 d 淘汰）
+    assert c.cache_hits == 2
+    assert c.cache_misses == 4
+    assert c.cache_evictions == 2  # 第 1 次淘汰 B；第 2 次淘汰 d（B 重插时最久未用）
 
 
 def test_compile_enum_schema():
