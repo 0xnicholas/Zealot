@@ -1,0 +1,43 @@
+{
+  "schema": "zealot-bench/v1",
+  "environment": {
+    "engine": "zealot",
+    "model": "<model-id>",
+    "gpu": "<GPU 型号，如 NVIDIA A100 80GB / H100>",
+    "driver_cuda": "<驱动/CUDA 版本>",
+    "engine_version": "<zealot git rev-parse HEAD>",
+    "vllm_commit": "<vLLM commit/tag（锁版本）>",
+    "max_num_seqs_aligned": "<与 vLLM --max-num-seqs 对齐的值>",
+    "quantization": "<量化方式或 null>"
+  },
+  "matrix": {
+    "concurrency": [1, 16, 64],
+    "input_length_tokens": [100, 1000, 4096],
+    "max_output_tokens": 256
+  },
+  "protocol": {
+    "warmup": "<预热说明>",
+    "stable_window_seconds": 60,
+    "rounds": 3,
+    "aggregation": "median",
+    "error_threshold_pct": 5
+  },
+  "results": [
+    {
+      "concurrency": 1,
+      "input_length_tokens": 100,
+      "requests_ok": 0,
+      "requests_total": 0,
+      "total_output_tokens": 0,
+      "throughput_tokens_per_s": 0.0,
+      "ttft_s": { "p50": null, "p95": null, "p99": null },
+      "tpot_s": { "p50": null, "p95": null, "p99": null },
+      "rounds": 3
+    }
+  ],
+  "comparison": {
+    "vllm_results": "<vLLM 同矩阵结果（同目录或引用）>",
+    "throughput_ratio": "<zealot / vLLM>",
+    "notes": "<环境差异、异常轮次、复跑记录>"
+  }
+}

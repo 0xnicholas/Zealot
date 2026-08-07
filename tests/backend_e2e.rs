@@ -144,6 +144,46 @@ async fn load_mock() -> (common::ChildGuard, String) {
     (guard, http_addr)
 }
 
+/// M5-⑪（issue #25）：HTTP dev 加载口 POST /admin/load → /v1/chat/completions
+/// 全链路（bench 脚本冒烟路径）。
+#[tokio::test]
+async fn http_admin_load_then_chat() {
+    let (_guard, _addr, http_addr) = common::spawn_backend_full().await;
+    // 未加载 → SERVICE_UNAVAILABLE
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{"model":"mock:tiny","messages":[{"role":"user","content":"hi"}],"max_tokens":4}"#,
+    );
+    assert_eq!(code, "503", "未加载模型应 503: {body}");
+
+    // HTTP 加载口
+    let out = Command::new("curl")
+        .args([
+            "-s",
+            "-X",
+            "POST",
+            &format!("http://{http_addr}/admin/load"),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            r#"{"model":"mock:tiny"}"#,
+        ])
+        .output()
+        .expect("curl failed");
+    assert!(out.status.success());
+    let body: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("parse admin/load JSON");
+    assert_eq!(body["ready"], true);
+
+    // 加载后可聊天
+    let (code, body) = http_chat(
+        &http_addr,
+        r#"{"model":"mock:tiny","messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":true}"#,
+    );
+    assert_eq!(code, "200", "chat 应 200: {body}");
+    assert!(body.contains("data: [DONE]"), "缺 [DONE]");
+}
+
 #[tokio::test]
 async fn http_response_format_json_schema_constrained_output() {
     let (_guard, http_addr) = load_mock().await;

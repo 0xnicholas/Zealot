@@ -36,6 +36,12 @@ pub enum ZealotError {
     #[error("Sequence too long: worst case needs {required} blocks, pool capacity is {capacity}")]
     SequenceTooLong { required: usize, capacity: usize },
 
+    #[error("Failed precondition: {0}")]
+    FailedPrecondition(String),
+
+    #[error("Already exists: {0}")]
+    AlreadyExists(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

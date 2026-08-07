@@ -266,6 +266,106 @@ fn map_priority(p: i32) -> Priority {
         P::Highest => Priority::Highest,
     }
 }
+impl Runtime {
+    // ── 模型加载公共路径（M5-⑪ Bench，issue #25）────────────────────
+    /// 加载模型公共路径（gRPC LoadModel 与 HTTP /admin/load 共用）。
+    async fn load_model_common(
+        &self,
+        model_id: String,
+        quantization: i32,
+    ) -> Result<LoadedModel, ZealotError> {
+        {
+            let slot = self
+                .lock_slot()
+                .map_err(|st| ZealotError::Internal(st.to_string()))?;
+            match &*slot {
+                ModelSlot::Empty => {}
+                ModelSlot::Loading => {
+                    return Err(ZealotError::FailedPrecondition(
+                        "a model load is already in progress".into(),
+                    ))
+                }
+                ModelSlot::Ready(h) => {
+                    return Err(ZealotError::AlreadyExists(format!(
+                        "model '{}' already loaded; UnloadModel first",
+                        h.model.model_id
+                    )))
+                }
+            }
+        }
+        *self
+            .lock_slot()
+            .map_err(|st| ZealotError::Internal(st.to_string()))? = ModelSlot::Loading;
+
+        // 加载是重阻塞操作（HF 下载 + CPU 读盘），移出 tokio 工作线程
+        // （M5-④：mock: 前缀走确定性 dev runner，附内置 byte 词表 tokenizer）
+        let model_id_clone = model_id.clone();
+        let (runner, mock_tok): (Box<dyn ModelRunner>, Option<Tokenizer>) =
+            match tokio::task::spawn_blocking(
+                move || -> Result<(Box<dyn ModelRunner>, Option<Tokenizer>), ZealotError> {
+                    if model_id_clone.starts_with("mock:") {
+                        let runner = MockModelRunner::load(&model_id_clone)?;
+                        let tok = runner.tokenizer();
+                        return Ok((Box::new(runner), Some(tok)));
+                    }
+                    #[cfg(feature = "cuda")]
+                    {
+                        match CudaModelRunner::load(&model_id_clone, 0) {
+                            Ok(r) => return Ok((Box::new(r), None)),
+                            Err(e) => {
+                                tracing::warn!("GPU runner unavailable, falling back to CPU: {e}");
+                            }
+                        }
+                    }
+                    Ok((Box::new(CpuModelRunner::load(&model_id_clone)?), None))
+                },
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    *self
+                        .lock_slot()
+                        .map_err(|st| ZealotError::Internal(st.to_string()))? = ModelSlot::Empty;
+                    return Err(e);
+                }
+                Err(e) => {
+                    *self
+                        .lock_slot()
+                        .map_err(|st| ZealotError::Internal(st.to_string()))? = ModelSlot::Empty;
+                    return Err(ZealotError::Internal(format!("load task failed: {e}")));
+                }
+            };
+
+        let eos = runner.eos_token_id();
+        let sched = Scheduler::new(SchedulerConfig::default())
+            .map_err(|e| ZealotError::Internal(e.to_string()))?;
+        let mut engine = Engine::new(sched, runner);
+        // Try to load tokenizer.json from model cache for Rust-side decoding
+        if let Ok(tok) = Tokenizer::load(&model_id) {
+            engine = engine.with_tokenizer(tok);
+        } else if let Some(tok) = mock_tok {
+            // dev mock：附加内置 byte 词表（vocab-mode 真实 token 校验）
+            engine = engine.with_tokenizer(tok);
+        }
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || run_engine(engine, eos, cmd_rx));
+
+        let model = LoadedModel {
+            model_id: model_id.clone(),
+            quantization,
+            gpu_count: 0, // CPU dev-mode
+            ready: true,
+        };
+        *self
+            .lock_slot()
+            .map_err(|st| ZealotError::Internal(st.to_string()))? = ModelSlot::Ready(SlotHandle {
+            cmd_tx,
+            model: model.clone(),
+        });
+        Ok(model)
+    }
+}
 
 fn infer_params_to_sampling(params: &runtime_v1::InferParams) -> SamplingParams {
     SamplingParams {
@@ -298,82 +398,13 @@ impl InferenceRuntime for Runtime {
         request: Request<LoadModelRequest>,
     ) -> Result<tonic::Response<LoadModelResponse>, Status> {
         let req = request.into_inner();
-        {
-            let slot = self.lock_slot()?;
-            match &*slot {
-                ModelSlot::Empty => {}
-                ModelSlot::Loading => {
-                    return Err(Status::failed_precondition(
-                        "a model load is already in progress",
-                    ))
-                }
-                ModelSlot::Ready(h) => {
-                    return Err(Status::already_exists(format!(
-                        "model '{}' already loaded; UnloadModel first",
-                        h.model.model_id
-                    )))
-                }
-            }
-        }
-        *self.lock_slot()? = ModelSlot::Loading;
-
-        let model_id = req.model_id.clone();
-        // 加载是重阻塞操作（HF 下载 + CPU 读盘），移出 tokio 工作线程
-        // （M5-④：mock: 前缀走确定性 dev runner，附内置 byte 词表 tokenizer）
-        let (runner, mock_tok): (Box<dyn ModelRunner>, Option<Tokenizer>) =
-            match tokio::task::spawn_blocking(
-                move || -> Result<(Box<dyn ModelRunner>, Option<Tokenizer>), ZealotError> {
-                    if model_id.starts_with("mock:") {
-                        let runner = MockModelRunner::load(&model_id)?;
-                        let tok = runner.tokenizer();
-                        return Ok((Box::new(runner), Some(tok)));
-                    }
-                    #[cfg(feature = "cuda")]
-                    {
-                        match CudaModelRunner::load(&model_id, 0) {
-                            Ok(r) => return Ok((Box::new(r), None)),
-                            Err(e) => {
-                                tracing::warn!("GPU runner unavailable, falling back to CPU: {e}");
-                            }
-                        }
-                    }
-                    Ok((Box::new(CpuModelRunner::load(&model_id)?), None))
-                },
-            )
+        self.load_model_common(req.model_id.clone(), req.quantization)
             .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    *self.lock_slot()? = ModelSlot::Empty;
-                    return Err(Status::internal(format!("model load failed: {e}")));
-                }
-                Err(e) => {
-                    *self.lock_slot()? = ModelSlot::Empty;
-                    return Err(Status::internal(format!("load task failed: {e}")));
-                }
-            };
-
-        let eos = runner.eos_token_id();
-        let sched = Scheduler::new(SchedulerConfig::default())
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let mut engine = Engine::new(sched, runner);
-        // Try to load tokenizer.json from model cache for Rust-side decoding
-        if let Ok(tok) = Tokenizer::load(&req.model_id) {
-            engine = engine.with_tokenizer(tok);
-        } else if let Some(tok) = mock_tok {
-            // dev mock：附加内置 byte 词表（vocab-mode 真实 token 校验）
-            engine = engine.with_tokenizer(tok);
-        }
-        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || run_engine(engine, eos, cmd_rx));
-
-        let model = LoadedModel {
-            model_id: req.model_id.clone(),
-            quantization: req.quantization,
-            gpu_count: 0, // CPU dev-mode
-            ready: true,
-        };
-        *self.lock_slot()? = ModelSlot::Ready(SlotHandle { cmd_tx, model });
+            .map_err(|e| match &e {
+                ZealotError::FailedPrecondition(m) => Status::failed_precondition(m.clone()),
+                ZealotError::AlreadyExists(m) => Status::already_exists(m.clone()),
+                other => Status::internal(other.to_string()),
+            })?;
         Ok(tonic::Response::new(LoadModelResponse {
             model_id: req.model_id,
             ready: true,
@@ -615,6 +646,31 @@ async fn health_check(State(backend): State<Runtime>) -> Json<serde_json::Value>
     Json(status)
 }
 
+/// bench/内部用 dev 加载口：`POST /admin/load` {"model": "mock:tiny"}（M5-⑪ Bench，issue #25）。
+/// 与 gRPC LoadModel 走同一 load_model_common 路径。
+#[derive(serde::Deserialize)]
+struct AdminLoadRequest {
+    model: String,
+}
+
+async fn admin_load(
+    State(backend): State<Runtime>,
+    Json(body): Json<AdminLoadRequest>,
+) -> axum::response::Response {
+    match backend.load_model_common(body.model.clone(), 0).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"model": body.model, "ready": true})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn handle_openai_chat(
     State(backend): State<Runtime>,
     Json(body): Json<ChatCompletionRequest>,
@@ -838,6 +894,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_openai_chat))
+        .route("/admin/load", post(admin_load))
         .route("/health", axum::routing::get(health_check))
         .route("/ready", axum::routing::get(health_check))
         .with_state(backend);

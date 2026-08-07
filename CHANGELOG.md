@@ -7,6 +7,14 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M5-⑪ Bench 对比基准（issue #25）——scripts/bench_openai.py（对齐 vLLM
+  benchmark_serving：并发 1/16/64 × 输入 ~100/1k/4k+ × 固定输出 256，聚合吞吐 +
+  TTFT/TPOT P50/P95/P99，预热 + 稳定窗口 ≥60s + 多轮取中位，JSON 报告 + 摘要对比表
+  含 vs vLLM 比值占位）；docs/benchmarks/（README 执行说明：锁 vLLM commit、同卡同参
+  max_num_seqs 对齐、预热/窗口/中位规则 + report-template.json）；后端新增
+  POST /admin/load dev 加载口（与 gRPC LoadModel 共用 load_model_common，bench/内部用），
+  ZealotError 增 FailedPrecondition/AlreadyExists 变体；无 GPU 冒烟（mock:tiny）验证
+  脚本正确性；e2e 增 http_admin_load_then_chat
 - M5-⑩：集成测试（issue #24）——JSON Schema Test Suite（draft-07）子集纳入回归：
   151 用例 / 9 文件 vendor 进 tests/json_schema_test_suite/（subset/ + SUBSET.md 排除
   记录 + pytest runner 152 项）；排除均系设计性差异（无 type 约束关键字报错、P2
