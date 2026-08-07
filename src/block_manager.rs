@@ -51,22 +51,20 @@ pub struct BlockManager {
 #[pymethods]
 impl BlockManager {
     #[new]
-    fn new(num_gpu_blocks: usize, block_size: usize) -> PyResult<Self> {
+    pub fn new(num_gpu_blocks: usize, block_size: usize) -> PyResult<Self> {
         Ok(Self::create(num_gpu_blocks, block_size)?)
     }
 
-    fn allocate(&self) -> PyResult<BlockHandle> {
+    pub fn allocate(&self) -> PyResult<BlockHandle> {
         Ok(self.try_allocate()?)
     }
 
-    fn free(&self, handle: &BlockHandle) -> PyResult<()> {
+    pub fn free(&self, handle: &BlockHandle) -> PyResult<()> {
         Ok(self.try_free(handle)?)
     }
 
     fn reference(&self, handle: &BlockHandle) -> PyResult<()> {
-        self.check_handle(handle)?;
-        self.refcount[handle.block_id].fetch_add(1, Ordering::AcqRel);
-        Ok(())
+        Ok(self.try_reference(handle)?)
     }
 
     #[getter]
@@ -87,7 +85,7 @@ impl BlockManager {
 
 impl BlockManager {
     /// Rust-native 构造路径（Scheduler 用）。[[new]] pymethod 委托到这里。
-    pub(crate) fn create(num_gpu_blocks: usize, block_size: usize) -> Result<Self, ZealotError> {
+    pub fn create(num_gpu_blocks: usize, block_size: usize) -> Result<Self, ZealotError> {
         if block_size == 0 {
             return Err(ZealotError::InvalidBlockSize(block_size));
         }
@@ -107,7 +105,7 @@ impl BlockManager {
 
     /// Rust-native 分配路径（Scheduler 用）。与 #[pymethods] 版本语义相同，
     /// 但返回 ZealotError 以便直接 match（如 OutOfBlocks 触发抢占）。
-    pub(crate) fn try_allocate(&self) -> Result<BlockHandle, ZealotError> {
+    pub fn try_allocate(&self) -> Result<BlockHandle, ZealotError> {
         let mut free = self.free_list.lock().unwrap();
         let block_id = free.pop().ok_or(ZealotError::OutOfBlocks {
             requested: 1,
@@ -124,7 +122,7 @@ impl BlockManager {
     }
 
     /// Rust-native 释放路径（Scheduler 用）。
-    pub(crate) fn try_free(&self, handle: &BlockHandle) -> Result<(), ZealotError> {
+    pub fn try_free(&self, handle: &BlockHandle) -> Result<(), ZealotError> {
         self.check(handle)?;
 
         let prev = self.refcount[handle.block_id].fetch_sub(1, Ordering::AcqRel);
@@ -136,8 +134,17 @@ impl BlockManager {
         Ok(())
     }
 
+    /// Rust-native 引用路径：增加一次引用计数（共享 block 时调用）。
+    /// 必须与持有者的最后一次 free 建立 happens-before 关系（调用方纪律，
+    /// 见 loom_tests 模块头注释）；违反时 generation 检查给出 StaleHandle。
+    pub fn try_reference(&self, handle: &BlockHandle) -> Result<(), ZealotError> {
+        self.check(handle)?;
+        self.refcount[handle.block_id].fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
     /// 当前空闲 block 数。
-    pub(crate) fn available(&self) -> usize {
+    pub fn available(&self) -> usize {
         self.free_list.lock().unwrap().len()
     }
 
@@ -154,10 +161,6 @@ impl BlockManager {
             });
         }
         Ok(())
-    }
-
-    fn check_handle(&self, handle: &BlockHandle) -> PyResult<()> {
-        Ok(self.check(handle)?)
     }
 }
 

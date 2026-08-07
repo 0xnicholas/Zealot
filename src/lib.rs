@@ -4,7 +4,7 @@ pub mod attention;
 pub mod block_manager;
 #[cfg(feature = "cuda")]
 pub mod buffer_pool;
-mod constrained_decode;
+pub mod constrained_decode;
 #[cfg(feature = "cuda")]
 pub mod cuda_runner;
 pub mod engine;

@@ -19,7 +19,7 @@ pub struct JsonSchemaCompiler {
 #[pymethods]
 impl JsonSchemaCompiler {
     #[new]
-    fn new(cache_size: usize, max_states: usize, max_compile_ms: u64) -> Self {
+    pub fn new(cache_size: usize, max_states: usize, max_compile_ms: u64) -> Self {
         Self {
             cache: Mutex::new(HashMap::with_capacity(cache_size.min(256))),
             cache_size,
@@ -29,7 +29,7 @@ impl JsonSchemaCompiler {
     }
 
     #[pyo3(signature = (schema_str, bypass_cache=None))]
-    fn compile(
+    pub fn compile(
         &self,
         schema_str: &str,
         bypass_cache: Option<bool>,

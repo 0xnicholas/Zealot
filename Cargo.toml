@@ -37,6 +37,16 @@ which = "6"
 pyo3 = { version = "0.23", features = ["auto-initialize"] }
 # M4 §12-2: Block Manager free list 并发模拟测试（loom model checker）
 loom = "0.7"
+# M4 §8.1: FFI 微基准（benches/）
+criterion = "0.5"
+
+[[bench]]
+name = "block_manager"
+harness = false
+
+[[bench]]
+name = "constrained_decode"
+harness = false
 
 [profile.release]
 lto = true

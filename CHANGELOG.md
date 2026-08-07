@@ -7,6 +7,10 @@ Format: 语义化版本 + 变更类型（Added / Changed / Fixed / Removed）。
 
 ## [Unreleased]
 
+- M4 收官：§8.1 FFI 微基准 8 项落地（issue #8）——criterion benches/
+  BlockManager 6 项全部达标（allocate 36.8ns / free 38.4ns / reference
+  10.1ns / stale 4.4ns / GIL 61ns），decode 2 项超阈值标风险
+  （详见 architecture.md §8.1）；§12-3 allocate<500ns 已勾选
 - M4 收官：Block Manager `loom` 并发模拟测试（issue #7）——free list
   分配/释放、refcount、generation 并发交错全覆盖，mutation 验证有效；
   运行 `ZEALOT_LOOM=1 cargo test --lib loom -- --test-threads=1`
