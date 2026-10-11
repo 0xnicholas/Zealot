@@ -43,6 +43,9 @@ use zealot_engine::sampling::SamplingParams;
 use zealot_engine::scheduler::{Priority, Scheduler, SchedulerConfig};
 use zealot_engine::tokenizer::Tokenizer;
 
+// clippy 1.98 起 result_large_err 命中 tonic 生成代码（tonic::Status 超过
+// 128 字节阈值），作用域化豁免生成模块
+#[allow(clippy::result_large_err)]
 mod runtime_v1 {
     tonic::include_proto!("runtime.v1");
 }
