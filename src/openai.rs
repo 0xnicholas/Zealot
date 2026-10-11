@@ -216,7 +216,7 @@ fn tool_envelope(tool: &Tool) -> serde_json::Value {
 ///
 /// 语义（M5-④）：
 /// - `response_format: json_schema` → schema 经 CD 编译链路（strict 时先校验）；
-/// - `json_object` → 不约束（additionalProperties 通配键留 Phase 3，见 matcher.rs 注释）；
+/// - `json_object` → 不约束（任意键 object 约束未实现，需要时再接）；
 /// - 强制 `tool_choice`（具名函数或 "required"）→ 工具信封 grammar（参数 schema 同样 strict 校验）；
 /// - `auto`/`none`/未提供 → 模型自由决定，不约束；
 /// - 强制工具 + json_schema 同时出现 → 错误（OpenAI 不允许组合）。
@@ -793,6 +793,9 @@ mod tests {
             r.tool_choice.as_ref(),
         )
         .expect("resolve");
-        assert!(g.is_none(), "json_object 不约束（通配键 Phase 3）");
+        assert!(
+            g.is_none(),
+            "json_object 不约束（任意键 object 约束未实现）"
+        );
     }
 }

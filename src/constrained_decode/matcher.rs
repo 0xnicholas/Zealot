@@ -206,10 +206,8 @@ fn count_states(gt: &GrammarType) -> usize {
 //
 // 已知简化（Phase 3 处置，已文档化）：
 // - 性能：状态未压缩、mask 未缓存（每次重建）——Phase 3 DFA 压缩/状态缓存
-// - String：minLength/maxLength/pattern 未在自动机中强制（Phase 3 随 pattern 一起）
 // - 转义序列宽松（`\x` 任意单字节视为合法转义）
 // - Union 同一起始字节的分支取先匹配（未做子集构造合并）
-// - additionalProperties 通配键未支持（只允许 schema 显式键）
 // - EOS 门控是 token-id 级：含结构字节的多字节 token（如 `Ġ}`）可绕过 EOS 屏蔽
 
 const MAX_AUTO_STATES: usize = 1 << 18; // 262144：压缩前防爆上限（超限 → SchemaTooComplex）
@@ -1956,8 +1954,8 @@ impl ConstrainedGrammar {
 
 impl ConstrainedGrammar {
     fn compute_allowed_tokens(&self, _state: usize) -> Vec<i32> {
-        // Phase 2: return a broad set of token IDs that match the grammar type.
-        // Phase 3+: integrate with tokenizer vocabulary for precise token-level constraints.
+        // 无词表时的 ASCII 占位（token ID ≈ 字节值）。真实词表校验走
+        // allowed_tokens_vocab（M5-③），本函数仅 PyO3 未 load_tokenizer 时触达。
         match &self.grammar_type {
             GrammarType::Any => {
                 // All common tokens: whitespace, punctuation, alphanumerics
