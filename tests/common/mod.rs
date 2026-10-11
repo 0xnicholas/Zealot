@@ -5,8 +5,9 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 
-// 同 src/bin：clippy 1.98 起 result_large_err 命中 tonic 生成代码
-#[allow(clippy::result_large_err)]
+// 同 src/bin：tonic 生成代码整体豁免 clippy（CI stable 工具链持续新增
+// lint，1.98 result_large_err、1.99 double_must_use 均命中生成项）
+#[allow(clippy::all)]
 pub mod runtime_v1 {
     tonic::include_proto!("runtime.v1");
 }
