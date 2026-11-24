@@ -7,7 +7,7 @@
 
 ## 0. 决策摘要
 
-1. **MindIE 不能作为 Zealot 的替代基线。** 官方文档明确写着：MindIE LLM 组件自 3.1.0 起暂停后续功能演进，现有功能维持维护状态，不再支持新特性和新模型；官方推荐的部署方式是 MindIE Motor + vLLM Ascend。[官方]
+1. **在当前公开证据下，MindIE 不能作为 Zealot 的替代基线。** 官方文档明确写着：MindIE LLM 组件自 3.1.0 起暂停后续功能演进，现有功能维持维护状态，不再支持新特性和新模型；官方推荐的部署方式是 MindIE Motor + vLLM Ascend。[官方]
 2. **“MindIE”已经不是单一引擎，而是分层产品族。** 其中唯一可能替代 vLLM 的是 MindIE LLM 引擎，而它已冻结；MindIE Motor 是服务化/调度层，当前只对接 vLLM-Ascend 与 SGLang，不提供自有推理引擎。[官方]
 3. **首发目标 A2 + Qwen3-8B BF16 的官方支持是成立的。** 模型矩阵把 Qwen3-8B 标为“充分验证支持”，Atlas 800I A2 单卡、128k 上下文、LoRA 与 atbgraph 均支持；但 3.1.0 的 CANN 配套只列到 9.1.0，与 vllm-ascend 0.30.0 的 CANN 9.2.1 不在同一版本行。[官方]
 4. **功能面与 vLLM 接近，但不等价。** OpenAI 兼容、连续批处理、PagedAttention、SplitFuse（chunked prefill）、Prefix Cache、异步调度都有；但 Qwen 模型上 Prefix Cache 与 SplitFuse 在官方特性矩阵中互斥，Function Call 的官方模型清单不含 Qwen3-8B（与模型 README 冲突），3.1.0 后也不再新增模型或特性。[官方]
@@ -77,7 +77,7 @@ MindIE LLM 3.1.0 文档的“简介”页顶部有一条醒目的说明：[官�
 需要注意两个细节：
 
 - 这条冻结说明出现在 **v3.1.0 发布分支的文档**中；`master` 分支的同名文件没有这句话，`master` 的代码合入也停在 2026-07-21。这说明冻结公告是 3.1.0 发布之后（约 2026-10）补进发布分支的文档变更，而不是 8 月发布时的原始说明。[官方/推断]
-- 3.1.0 版本说明标注“维护周期：三个月”。从 2026-08 起算，到 2026-11 已接近或到达该窗口末端；冻结说明只说“维持维护状态”，没有承诺安全补丁的期限。[官方/推断]
+- 3.1.0 版本说明标注“维护周期：三个月”。从 2026-08 起算，到 2026-11-25 已到达或略过该窗口末端；冻结说明只说“维持维护状态”，没有承诺安全补丁的期限。[官方/推断]
 
 ### 2.4 MindIE Motor 不是引擎，是 vLLM/SGLang 之上的调度层
 
@@ -283,7 +283,7 @@ MindIE LLM 的架构文档明确写了 Continuous Batching、PagedAttention、Fl
 
 来源：<https://gitcode.com/Ascend/MindIE-LLM/blob/master/docs/zh/user_guide/user_manual/service_parameter_configuration.md>。
 
-这些默认值说明：**MindIE 镜像开箱即用的上下文窗口只有 2560**，不是模型支持的 128k。要跑 Zealot 的在线场景，必须改 `maxSeqLen`、`maxInputTokenLen`、`maxIterTimes`，并重新估算 `npuMemSize` 与 `maxBatchSize`。这是部署复杂度的一部分，不是“拉起就能用”。[官方/推断]
+这些默认值说明：**默认配置的 `maxSeqLen` 只有 2560**，不是模型支持的 128k。要跑 Zealot 的在线场景，必须改 `maxSeqLen`、`maxInputTokenLen`、`maxIterTimes`，并重新估算 `npuMemSize` 与 `maxBatchSize`。这是部署复杂度的一部分，不是“拉起就能用”。[官方/推断]
 
 ### 5.4 Chunked prefill：SplitFuse
 
@@ -567,7 +567,7 @@ vLLM 侧版本与支持矩阵来自票据 01/02 及其报告；DeepInfer 侧来�
 
 ### 11.1 对票据问题的直接回答
 
-**MindIE 应作为“原生官方对照 + 可选的服务/调度组件”，不应作为“替代 vLLM + vllm-ascend 的基线”。**
+**在当前公开证据与 2026-11 的产品状态下，MindIE 应作为“原生官方对照 + 可选的服务/调度组件”，不应作为“替代 vLLM + vllm-ascend 的基线”。**
 
 理由按权重排序：
 
